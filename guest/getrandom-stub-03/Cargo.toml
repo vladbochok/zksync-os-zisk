@@ -1,0 +1,10 @@
+[package]
+name = "getrandom"
+version = "0.3.4"
+edition = "2021"
+
+[features]
+std = []
+custom = []
+wasm_js = []
+js = []

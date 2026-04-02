@@ -1,0 +1,21 @@
+[package]
+name = "zksync-os-zisk-lib"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+zksync-os-revm = { path = "../../zksync-os-revm", default-features = false }
+revm = { version = "=34.0.0", default-features = false, features = ["std", "optional_balance_check", "serde"] }
+serde = { version = "1", features = ["derive"] }
+bincode = "1.3"
+alloy-primitives = { version = "1", default-features = false }
+alloy-consensus = { version = "1", default-features = false, features = ["k256"] }
+alloy-eips = { version = "1", default-features = false }
+blake2 = "0.10"
+tiny-keccak = { version = "2.0", features = ["keccak"] }
+
+[features]
+default = ["c-libs"]
+# Enable C-based crypto (secp256k1, blst, c-kzg) — for native builds
+c-libs = ["revm/secp256k1", "revm/blst", "revm/c-kzg", "zksync-os-revm/c-libs"]
