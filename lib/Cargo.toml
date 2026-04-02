@@ -5,7 +5,7 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-zksync-os-revm = { path = "../../zksync-os-revm", default-features = false }
+zksync-os-revm = { git = "https://github.com/vladbochok/zksync-os-revm", branch = "vb/second-proof-system", default-features = false }
 revm = { version = "=34.0.0", default-features = false, features = ["std", "optional_balance_check", "serde"] }
 serde = { version = "1", features = ["derive"] }
 bincode = "1.3"

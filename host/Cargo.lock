@@ -3170,6 +3170,7 @@ dependencies = [
 [[package]]
 name = "zksync-os-revm"
 version = "0.1.0"
+source = "git+https://github.com/vladbochok/zksync-os-revm?branch=vb%2Fsecond-proof-system#9391f9e216047e61cd10c253ab7f59c1148e3b91"
 dependencies = [
  "auto_impl",
  "revm",
