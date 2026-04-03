@@ -58,6 +58,11 @@ pub fn empty_subtree_hash(depth: u8) -> B256 {
     empty_subtree_hashes()[depth as usize]
 }
 
+/// Returns a Vec of empty subtree hashes for each depth 0..TREE_DEPTH.
+pub fn empty_subtree_hashes_vec() -> Vec<B256> {
+    empty_subtree_hashes().clone()
+}
+
 // ---------------------------------------------------------------------------
 // Proof types
 // ---------------------------------------------------------------------------
@@ -196,7 +201,12 @@ pub struct BatchTreeUpdate {
     pub operations: Vec<WriteOp>,
     pub entries: Vec<(B256, B256)>,
     pub sorted_leaves: Vec<(u64, TreeLeaf)>,
+    /// Intermediate sibling hashes for reconstructing the OLD root from sorted_leaves.
     pub intermediate_hashes: Vec<B256>,
+    /// Intermediate sibling hashes for reconstructing the NEW root after applying operations.
+    /// When empty, falls back to intermediate_hashes (backward compat for updates-only).
+    #[serde(default)]
+    pub intermediate_hashes_new: Vec<B256>,
     pub leaf_count_before: u64,
 }
 
@@ -252,14 +262,23 @@ impl BatchTreeUpdate {
         }
 
         leaves.sort_by_key(|(idx, _)| *idx);
-        let new_root = self.zip_leaves(&leaves, next_tree_index);
+        // Use separate intermediate hashes for new root if available
+        let new_root = if !self.intermediate_hashes_new.is_empty() {
+            self.zip_leaves_with(&leaves, next_tree_index, &self.intermediate_hashes_new)
+        } else {
+            self.zip_leaves(&leaves, next_tree_index)
+        };
         (new_root, next_tree_index)
     }
 
     /// Reconstruct the root hash from sorted leaves and intermediate hashes.
     fn zip_leaves(&self, sorted_leaves: &[(u64, TreeLeaf)], leaf_count: u64) -> B256 {
+        self.zip_leaves_with(sorted_leaves, leaf_count, &self.intermediate_hashes)
+    }
+
+    fn zip_leaves_with(&self, sorted_leaves: &[(u64, TreeLeaf)], leaf_count: u64, hashes: &[B256]) -> B256 {
         let empty_hashes = empty_subtree_hashes();
-        let mut hashes_iter = self.intermediate_hashes.iter();
+        let mut hashes_iter = hashes.iter();
 
         let mut node_hashes: Vec<(u64, B256)> = sorted_leaves
             .iter()

@@ -88,6 +88,12 @@ pub struct BlockInput {
     /// The guest verifies consistency by checking that L1Messenger EVM log events
     /// in the REVM execution match these L2→L1 log entries.
     pub l2_to_l1_logs: Vec<L2ToL1LogEntry>,
+    /// Per-block tree root that this block's merkle proofs were extracted from.
+    /// For the first block in a batch this equals batch_meta.tree_root_before.
+    /// For subsequent blocks this is the tree root after prior blocks' writes.
+    /// Defaults to B256::ZERO for backward compat (executor falls back to batch root).
+    #[serde(default)]
+    pub expected_tree_root: B256,
 }
 
 #[derive(Serialize, Deserialize, Clone)]

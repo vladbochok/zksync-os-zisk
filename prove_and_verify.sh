@@ -116,9 +116,9 @@ if [ "$START_STAGE" -le 6 ]; then
     echo "  (Requires ~64GB RAM)"
     RAM_GB=$(free -g | awk '/^Mem:/{print $2}')
     if [ "$RAM_GB" -lt 50 ]; then
-        echo "  WARNING: Only ${RAM_GB}GB RAM available, aggregation needs ~64GB."
-        echo "  SKIPPED: Run on a machine with more RAM."
-        echo "  Command: cargo-zisk prove -e $ELF -i $WORK_DIR/input.bin -k \$HOME/.zisk/provingKey -o $WORK_DIR/stark_proof --emulator --aggregation --compressed --save-proofs -v"
+        echo "  ERROR: Only ${RAM_GB}GB RAM available, aggregation needs ~64GB."
+        echo "  Run on a machine with at least 64GB RAM."
+        exit 1
     else
         mkdir -p "$WORK_DIR/stark_proof"
         cargo-zisk prove \
@@ -142,10 +142,12 @@ if [ "$START_STAGE" -le 7 ]; then
     SNARK_KEY="${ZISK_SNARK_KEY:-$HOME/.zisk/provingKeySnark}"
     STARK_PROOF="$WORK_DIR/stark_proof/proof.bin"
     if [ ! -f "$STARK_PROOF" ]; then
-        echo "  SKIPPED: No STARK proof at $STARK_PROOF (run stage 6 first)"
+        echo "  ERROR: No STARK proof at $STARK_PROOF (run stage 6 first)"
+        exit 1
     elif [ ! -d "$SNARK_KEY" ]; then
-        echo "  SKIPPED: SNARK proving key not found at $SNARK_KEY"
-        echo "  Download from ZiSK releases."
+        echo "  ERROR: SNARK proving key not found at $SNARK_KEY"
+        echo "  Download via: ziskup setup_snark"
+        exit 1
     else
         mkdir -p "$WORK_DIR/snark_proof"
         cargo-zisk prove-snark \

@@ -117,6 +117,7 @@ fn make_sample_batch() -> BatchInput {
             account_preimages: vec![],
             storage: vec![], bytecodes: vec![], block_hashes: vec![],
             l2_to_l1_logs: vec![],
+            expected_tree_root: B256::ZERO,
         }],
     }
 }
