@@ -403,10 +403,41 @@ mod tests {
 
         println!("Genesis batch: chain_id={}, blocks={}", batch.chain_id, batch.blocks.len());
         for (i, b) in batch.blocks.iter().enumerate() {
-            println!("  Block {}: {} txs, types: {:?}",
+            println!("  Block {}: {} txs, types: {:?}, {} bytecodes, {} accounts, {} account_preimages",
                 b.number, b.transactions.len(),
-                b.transactions.iter().map(|t| format!("0x{:02x}", t.tx_type)).collect::<Vec<_>>()
+                b.transactions.iter().map(|t| format!("0x{:02x}", t.tx_type)).collect::<Vec<_>>(),
+                b.bytecodes.len(), b.accounts.len(), b.account_preimages.len(),
             );
+            for tx in &b.transactions {
+                println!("    tx: caller={}, to={:?}, data_len={}, gas_limit={}, value={}",
+                    tx.caller, tx.to, tx.data.len(), tx.gas_limit, tx.value);
+            }
+            // Show bytecodes hashes
+            println!("    bytecodes:");
+            for (hash, code) in &b.bytecodes {
+                println!("      {}: {} bytes", hash, code.len());
+            }
+            // Check if tx target's code is in bytecodes
+            for tx in &b.transactions {
+                if let Some(to) = tx.to {
+                    let acct = b.accounts.iter().find(|(a, _)| *a == to);
+                    if let Some((_, data)) = acct {
+                        let has_code = b.bytecodes.iter().any(|(h, _)| *h == data.code_hash);
+                        println!("    target {} code_hash={} in_bytecodes={}", to, data.code_hash, has_code);
+                    }
+                }
+            }
+            // Show system contract accounts
+            for (addr, data) in &b.accounts {
+                let a: u64 = {
+                    let bytes = addr.as_slice();
+                    u64::from_be_bytes(bytes[12..20].try_into().unwrap_or_default())
+                };
+                if a >= 0x8000 && a <= 0x8100 {
+                    println!("    sys acct: {} nonce={} balance={} code_hash={}",
+                        addr, data.nonce, data.balance, data.code_hash);
+                }
+            }
         }
 
         if let Some(ref tu) = batch.batch_meta.tree_update {
