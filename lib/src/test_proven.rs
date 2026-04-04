@@ -424,6 +424,16 @@ mod tests {
                     if let Some((_, data)) = acct {
                         let has_code = b.bytecodes.iter().any(|(h, _)| *h == data.code_hash);
                         println!("    target {} code_hash={} in_bytecodes={}", to, data.code_hash, has_code);
+                        // Check if there's a bytecode whose keccak256 matches code_hash
+                        let has_keccak_match = b.bytecodes.iter().any(|(_, code)| {
+                            alloy_primitives::keccak256(code) == data.code_hash
+                        });
+                        println!("    target {} keccak_match={}", to, has_keccak_match);
+                        // Show first 3 bytecode hashes for comparison
+                        for (h, c) in b.bytecodes.iter().take(3) {
+                            let k = alloy_primitives::keccak256(c);
+                            println!("      bytecode_key={} keccak={} len={}", h, k, c.len());
+                        }
                     }
                 }
             }
