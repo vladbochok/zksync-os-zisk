@@ -582,7 +582,7 @@ fn build_proven_tx(input: &TxInput) -> ZKsyncTx<TxEnv> {
         // the claimed l1_tx_hash. Both fields are required — without them an
         // attacker could use a real l1_tx_hash while substituting tx fields
         // (e.g., inflating mint amount).
-        let signed_bytes = input.signed_tx_bytes.as_ref().unwrap_or_else(|| {
+        let _signed_bytes = input.signed_tx_bytes.as_ref().unwrap_or_else(|| {
             panic!(
                 "L1 transaction from {} missing signed_tx_bytes — \
                  every L1 tx must include encoded bytes for hash verification",
