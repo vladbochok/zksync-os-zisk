@@ -459,8 +459,27 @@ mod tests {
             let updates = tu.operations.iter().filter(|o| matches!(o, crate::merkle::WriteOp::Update { .. })).count();
             println!("  inserts: {inserts}, updates: {updates}");
 
+            // Check storage for proxy implementation slot
+            let proxy_impl_slot = "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc";
+            let proxy_addr: alloy_primitives::Address = "0x000000000000000000000000000000000000800f".parse().unwrap();
+            let found_storage = batch.blocks[0].storage.iter()
+                .find(|(a, s, _)| *a == proxy_addr);
+            println!("  0x800f proxy storage entries: {}",
+                batch.blocks[0].storage.iter().filter(|(a, _, _)| *a == proxy_addr).count());
+            if let Some((_, slot, val)) = found_storage {
+                println!("    slot={}, val={}", slot, val);
+            }
+
             // Now run REVM and compare writes
             let output = executor::execute_batch(&batch);
+            for (i, br) in output.block_results.iter().enumerate() {
+                println!("  REVM block {}: {} tx_results, {} storage_diffs, {} account_diffs",
+                    br.block_number, br.tx_results.len(), br.storage_diffs.len(), br.account_diffs.len());
+                for (j, tx) in br.tx_results.iter().enumerate() {
+                    let output_hex: String = tx.output.iter().map(|b| format!("{:02x}", b)).collect();
+                    println!("    tx[{j}]: success={}, gas={}, output=0x{}", tx.success, tx.gas_used, output_hex);
+                }
+            }
             let revm_writes: HMap<B256, B256> = output.block_results.iter()
                 .flat_map(|br| br.storage_diffs.iter().map(|d| {
                     let addr: [u8; 20] = d.address.into_array();

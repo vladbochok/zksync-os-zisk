@@ -760,7 +760,17 @@ fn build_simple_db(block: &BlockInput) -> SimpleDB {
     }
     let mut bytecodes = HashMap::new();
     for (hash, code) in &block.bytecodes {
-        bytecodes.insert(*hash, Bytecode::new_raw(Bytes::copy_from_slice(code)));
+        let bytecode = Bytecode::new_raw(Bytes::copy_from_slice(code));
+        // Store under the original key (keccak256 observable hash)
+        bytecodes.insert(*hash, bytecode.clone());
+        // Also store under blake2s256 hash for deployer precompile compatibility.
+        // The deployer precompile looks up by blake2s256(padded_code), not keccak256(raw_code).
+        use blake2::{Blake2s256, Digest};
+        let padded_len = (code.len() + 31) / 32 * 32; // pad to 32-byte boundary
+        let mut padded = vec![0u8; padded_len];
+        padded[..code.len()].copy_from_slice(code);
+        let blake2_hash = B256::from_slice(&Blake2s256::digest(&padded));
+        bytecodes.insert(blake2_hash, bytecode);
     }
     let mut block_hashes = HashMap::new();
     for &(num, hash) in &block.block_hashes {
