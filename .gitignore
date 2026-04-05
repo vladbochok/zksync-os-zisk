@@ -6,3 +6,5 @@
 # Foundry build artifacts
 /contracts/cache/
 /contracts/out/
+lib/target/
+lib/Cargo.lock
