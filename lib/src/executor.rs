@@ -441,7 +441,7 @@ fn execute_block_proven(
     let proven_db = build_proven_db(block, expected_root, batch_meta);
     let cache_db = CacheDB::new(proven_db);
     let (tx_results, storage_diffs, account_diffs, computed_l2_to_l1_logs) =
-        run_evm_and_collect_diffs(chain_id, spec_id, block, cache_db, false);
+        run_evm_and_collect_diffs(chain_id, spec_id, block, batch_meta, cache_db, false);
     // In proven mode, verify every account that changed state has a verified
     // "before" value. If an account's nonce/balance changed, its "before"
     // value must come from a preimage (merkle-verified) or be provably zero
@@ -862,7 +862,7 @@ pub fn execute_batch(input: &BatchInput) -> BatchOutput {
 
     let mut block_results = Vec::with_capacity(input.blocks.len());
     for block in &input.blocks {
-        block_results.push(execute_block_unverified(input.chain_id, spec_id, block));
+        block_results.push(execute_block_unverified(input.chain_id, spec_id, block, &input.batch_meta));
     }
 
     BatchOutput {
@@ -950,6 +950,7 @@ fn run_evm_and_collect_diffs<DB: DatabaseRef>(
     chain_id: u64,
     spec_id: ZkSpecId,
     block: &BlockInput,
+    batch_meta: &BatchMeta,
     mut cache_db: CacheDB<DB>,
     allow_overrides: bool,
 ) -> (Vec<TxOutput>, Vec<StorageDiff>, Vec<AccountDiff>, Vec<L2ToL1LogEntry>)
@@ -988,11 +989,22 @@ where
             Ok(result) => {
                 let success = result.is_success();
 
-                // For L1→L2 priority txs, emit the bootloader result log via chain context.
-                if tx_input.is_l1_tx {
-                    if let Some(l1_hash) = &tx_input.l1_tx_hash {
-                        evm.0.ctx.chain.emit_l1_tx_result(*l1_hash, success);
-                    }
+                // For L1→L2 transactions (both priority and upgrade), emit the
+                // bootloader result log. In zksync-os, process_l1_transaction
+                // calls emit_l1_l2_tx_log for both is_priority_op=true and false.
+                //
+                // Priority txs have l1_tx_hash in the tx input.
+                // Upgrade txs (0x7e) have their hash in batch_meta.upgrade_tx_hash.
+                let bootloader_log_hash = if tx_input.is_l1_tx {
+                    tx_input.l1_tx_hash
+                } else if tx_input.tx_type == 0x7e {
+                    let h = batch_meta.upgrade_tx_hash;
+                    if h.is_zero() { None } else { Some(h) }
+                } else {
+                    None
+                };
+                if let Some(tx_hash) = bootloader_log_hash {
+                    evm.0.ctx.chain.emit_l1_tx_result(tx_hash, success);
                 }
 
                 // Collect all L2→L1 logs from the chain context:
@@ -1089,11 +1101,11 @@ where
     (tx_results, storage_diffs, account_diffs, computed_l2_to_l1_logs)
 }
 
-fn execute_block_unverified(chain_id: u64, spec_id: ZkSpecId, block: &BlockInput) -> BlockResult {
+fn execute_block_unverified(chain_id: u64, spec_id: ZkSpecId, block: &BlockInput, batch_meta: &BatchMeta) -> BlockResult {
     let db = build_simple_db(block);
     let cache_db = CacheDB::new(db);
     let (tx_results, storage_diffs, account_diffs, computed_logs) =
-        run_evm_and_collect_diffs(chain_id, spec_id, block, cache_db, true);
+        run_evm_and_collect_diffs(chain_id, spec_id, block, batch_meta, cache_db, true);
     // Unverified mode: use computed logs (from EVM execution) if available,
     // fall back to input logs for backward compat with inputs that lack EVM log data.
     let l2_to_l1_logs = if computed_logs.is_empty() {
