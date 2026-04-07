@@ -1011,12 +1011,23 @@ const BOOTLOADER_ADDRESS: Address = address!("0000000000000000000000000000000000
 
 /// Extract L2→L1 logs from EVM execution output.
 ///
-/// The L1Messenger precompile (0x8008) emits standard EVM logs with the
-/// `L1MessageSent(address,bytes32,bytes)` topic. This function reconstructs
-/// the ZKsync L2→L1 log entries from those EVM logs.
+/// ZKsync OS produces exactly two kinds of L2→L1 logs:
 ///
-/// For L1→L2 priority transactions, the bootloader emits a status log
-/// (success/failure) — these are synthesized from the tx result + l1_tx_hash.
+/// 1. **User messages** from `L1Messenger.sendToL1()`: The precompile at 0x8008
+///    emits an EVM log with topic `L1MessageSent(address,bytes32,bytes)`.
+///    Reconstructed as: sender=0x8008, key=caller_padded, value=keccak(message).
+///
+/// 2. **L1→L2 tx status** from the bootloader: After each priority transaction,
+///    a log records whether execution succeeded. Synthesized from tx metadata:
+///    sender=0x8001, key=l1_tx_hash, value=success_flag.
+///
+/// This covers all L2→L1 log types in the current protocol. System contracts
+/// (Compressor, KnownCodesStorage, L2BaseToken) call `sendToL1()` which goes
+/// through case 1. No contract calls `sendL2ToL1Log()` directly.
+///
+/// SAFETY: The proven path asserts that computed logs match input logs.
+/// If the protocol adds new log types, this assertion will catch the mismatch
+/// and the function must be extended.
 fn extract_l2_to_l1_logs_from_evm(
     evm_logs: &[revm::primitives::Log],
     tx_number_in_block: u16,
