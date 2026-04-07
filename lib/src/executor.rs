@@ -1010,8 +1010,8 @@ fn run_evm_and_collect_diffs<DB: DatabaseRef>(
 where
     DB::Error: core::fmt::Debug,
 {
-    // Clear any stale L2→L1 logs from previous executions on this thread.
-    zksync_os_revm::l2_to_l1_logs::clear_logs();
+    // Scoped log collector — clears on creation, drains per-tx, clears on drop.
+    let mut log_collector = zksync_os_revm::l2_to_l1_logs::LogCollector::new();
 
     let mut evm = <ZkContext<_>>::default()
         .with_db(&mut cache_db)
@@ -1034,9 +1034,7 @@ where
 
     for (tx_idx, tx_input) in block.transactions.iter().enumerate() {
         let tx_number = tx_idx as u16;
-
-        // Tell the L1Messenger precompile which tx number we're executing.
-        zksync_os_revm::l2_to_l1_logs::set_tx_number(tx_number);
+        log_collector.set_tx_number(tx_number);
 
         let tx = if allow_overrides {
             build_tx(tx_input)
@@ -1069,9 +1067,8 @@ where
                     }
                 }
 
-                // Collect L2→L1 logs recorded by the L1Messenger precompile
-                // during this transaction's execution.
-                for log in zksync_os_revm::l2_to_l1_logs::take_logs() {
+                // Collect L2→L1 logs recorded by the L1Messenger precompile.
+                for log in log_collector.take_tx_logs() {
                     computed_l2_to_l1_logs.push(L2ToL1LogEntry {
                         l2_shard_id: log.l2_shard_id,
                         is_service: log.is_service,
