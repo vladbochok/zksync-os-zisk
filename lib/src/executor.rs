@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use revm::context::TxEnv;
 use revm::database::CacheDB;
 use revm::database_interface::DBErrorMarker;
-use revm::primitives::{Address, B256, Bytes, TxKind, U256, KECCAK_EMPTY, address};
+use revm::primitives::{Address, B256, Bytes, TxKind, U256, KECCAK_EMPTY};
 use revm::state::{AccountInfo, Bytecode};
 use revm::{DatabaseRef, ExecuteCommitEvm};
 use zksync_os_revm::transaction::abstraction::ZKsyncTxBuilder;
@@ -946,9 +946,6 @@ fn build_simple_db(block: &BlockInput) -> SimpleDB {
 // Shared EVM execution and diff collection
 // ---------------------------------------------------------------------------
 
-/// Bootloader formal address — used as sender for L1→L2 tx status logs.
-const BOOTLOADER_ADDRESS: Address = address!("0000000000000000000000000000000000008001");
-
 fn run_evm_and_collect_diffs<DB: DatabaseRef>(
     chain_id: u64,
     spec_id: ZkSpecId,
@@ -991,29 +988,16 @@ where
             Ok(result) => {
                 let success = result.is_success();
 
-                // For L1→L2 priority txs, synthesize the bootloader status log.
-                // In zksync-os this is emitted by the bootloader via emit_l1_l2_tx_log().
-                // REVM has no bootloader, so we synthesize it from tx metadata.
+                // For L1→L2 priority txs, emit the bootloader result log via chain context.
                 if tx_input.is_l1_tx {
                     if let Some(l1_hash) = &tx_input.l1_tx_hash {
-                        computed_l2_to_l1_logs.push(L2ToL1LogEntry {
-                            l2_shard_id: 0,
-                            is_service: true,
-                            tx_number_in_block: tx_number,
-                            sender: BOOTLOADER_ADDRESS,
-                            key: *l1_hash,
-                            value: if success {
-                                let mut v = B256::ZERO;
-                                v.0[31] = 1;
-                                v
-                            } else {
-                                B256::ZERO
-                            },
-                        });
+                        evm.0.ctx.chain.emit_l1_tx_result(*l1_hash, success);
                     }
                 }
 
-                // Collect L2→L1 logs from the chain context (set by L1Messenger precompile).
+                // Collect all L2→L1 logs from the chain context:
+                // - L1Messenger.sendToL1() logs (from precompile)
+                // - L1→L2 tx result logs (from emit_l1_tx_result above)
                 for log in evm.0.ctx.chain.take_logs() {
                     computed_l2_to_l1_logs.push(L2ToL1LogEntry {
                         l2_shard_id: log.l2_shard_id,
