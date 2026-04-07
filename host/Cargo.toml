@@ -14,3 +14,6 @@ alloy-primitives = "1"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 hex = "0.4"
+
+[patch."https://github.com/vladbochok/zksync-os-revm"]
+zksync-os-revm = { path = "/tmp/zksync-os-revm-patched" }

@@ -59,21 +59,35 @@ impl DatabaseRef for ProvenDB {
     type Error = ProvenDBError;
 
     fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
-        // Account info was verified during construction from merkle proofs.
-        // If an account isn't in verified_accounts, it doesn't exist in the proven state.
-        Ok(self.verified_accounts.get(&address).cloned())
+        let result = self.verified_accounts.get(&address).cloned();
+        if trace_enabled() {
+            let has_code = result.as_ref().map(|a| a.code_hash != KECCAK_EMPTY && a.code_hash != B256::ZERO).unwrap_or(false);
+            if result.is_none() {
+                eprintln!("TRACE basic({address}) → NONE");
+            } else if has_code {
+                eprintln!("TRACE basic({address}) → code");
+            }
+        }
+        Ok(result)
     }
 
     fn code_by_hash_ref(&self, code_hash: B256) -> Result<Bytecode, Self::Error> {
-        // Bytecodes were verified (keccak256(code) == hash) during construction.
-        Ok(self
-            .bytecodes
-            .get(&code_hash)
-            .cloned()
-            .unwrap_or_default())
+        let result = self.bytecodes.get(&code_hash).cloned().unwrap_or_default();
+        if trace_enabled() && code_hash != KECCAK_EMPTY && code_hash != B256::ZERO && result.is_empty() {
+            eprintln!("TRACE code_by_hash({code_hash}) → EMPTY");
+        }
+        Ok(result)
     }
 
     fn storage_ref(&self, address: Address, index: U256) -> Result<U256, Self::Error> {
+        if trace_enabled() {
+            // Count total storage reads to detect loops
+            static STORAGE_READ_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let count = STORAGE_READ_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if count % 1000 == 0 && count > 0 {
+                eprintln!("TRACE storage_reads={count} addr={address} slot={index}");
+            }
+        }
         let addr_bytes: [u8; 20] = address.into_array();
         let slot = B256::from(index.to_be_bytes::<32>());
         let flat_key = merkle::derive_flat_storage_key(&addr_bytes, &slot);
@@ -99,6 +113,9 @@ impl DatabaseRef for ProvenDB {
             self.verified_storage.borrow_mut().insert(flat_key, value);
             Ok(value.map(|v| U256::from_be_bytes(v.0)).unwrap_or_default())
         } else {
+            if trace_enabled() {
+                eprintln!("TRACE storage({address}, {index}) → NO_PROOF flat_key={flat_key}");
+            }
             Err(ProvenDBError(format!(
                 "no merkle proof for storage read: address={address}, slot={index}, flat_key={flat_key}"
             )))
@@ -258,6 +275,11 @@ pub fn execute_and_commit(input: &BatchInput) -> (BatchOutput, B256) {
 
     // Use the COMPUTED block header hash (from execution), not the input's block_header_hash
     let last_block_result = output.block_results.last().unwrap();
+    eprintln!("DEBUG prev_block_hashes count={}, non_zero={}, canonical={}",
+        meta.previous_block_hashes.len(),
+        meta.previous_block_hashes.iter().filter(|h| !h.is_zero()).count(),
+        last_block_result.computed_block_header_hash,
+    );
     let block_hashes_blake_after = commitment::block_hashes_blake(
         &meta.previous_block_hashes,
         &last_block_result.computed_block_header_hash,
@@ -283,7 +305,8 @@ pub fn execute_and_commit(input: &BatchInput) -> (BatchOutput, B256) {
                     l1_tx_hashes.push(*h);
                 }
                 num_l1_txs += 1;
-            } else {
+            } else if tx.tx_type != 0x7e {
+                // Upgrade txs (0x7e) are system txs that count as neither L1 nor L2.
                 num_l2_txs += 1;
             }
         }
@@ -296,7 +319,14 @@ pub fn execute_and_commit(input: &BatchInput) -> (BatchOutput, B256) {
 
     let priority_ops_hash = commitment::priority_ops_rolling_hash(&l1_tx_hashes);
     let l2_logs_local_root = commitment::l2_to_l1_logs_root(&l2_to_l1_encoded_logs);
-    let l2_logs_root_hash = commitment::keccak_two(&l2_logs_local_root, &meta.multichain_root);
+    // For protocol v30, multichain_root is zero in the l2_logs_root computation.
+    // For v31+, use the actual multichain_root.
+    let effective_multichain_root = if input.protocol_version_minor >= 31 {
+        meta.multichain_root
+    } else {
+        B256::ZERO
+    };
+    let l2_logs_root_hash = commitment::keccak_two(&l2_logs_local_root, &effective_multichain_root);
 
     let da_commitment = match meta.da_commitment_scheme {
         0 | 1 => B256::ZERO,                                          // None / EmptyNoDA
@@ -337,6 +367,96 @@ pub fn execute_and_commit(input: &BatchInput) -> (BatchOutput, B256) {
 
     let commitment = commitment::batch_public_input_hash(&state_before, &state_after, &batch_hash);
     (output, commitment)
+}
+
+/// Debug: return the three commitment components alongside the final hash.
+/// Returns (output, commitment, state_before, state_after, batch_hash).
+pub fn execute_and_commit_debug(input: &BatchInput) -> (BatchOutput, B256, B256, B256, B256) {
+    // Re-use execute_and_commit internals by running the same logic
+    // and extracting intermediate values.
+    let (output, _) = execute_and_commit(input);
+
+    // Re-derive the commitment components from the output + input.
+    let meta = &input.batch_meta;
+    let state_before = commitment::state_commitment_hash(
+        &meta.tree_root_before,
+        meta.leaf_count_before,
+        meta.block_number_before,
+        &meta.block_hashes_blake_before,
+        meta.last_block_timestamp_before,
+    );
+
+    let last_block = input.blocks.last().unwrap();
+    let last_br = output.block_results.last().unwrap();
+
+    let (tree_root_after, new_leaf_count) = if let Some(ref tree_update) = meta.tree_update {
+        tree_update.apply(&meta.tree_root_before)
+    } else {
+        (meta.tree_root_before, meta.leaf_count_before)
+    };
+
+    let block_hashes_blake_after = commitment::block_hashes_blake(
+        &meta.previous_block_hashes,
+        &last_br.computed_block_header_hash,
+    );
+    let state_after = commitment::state_commitment_hash(
+        &tree_root_after,
+        new_leaf_count,
+        last_block.number,
+        &block_hashes_blake_after,
+        last_block.timestamp,
+    );
+
+    let mut l1_tx_hashes = Vec::new();
+    let mut l2_to_l1_encoded_logs = Vec::new();
+    let mut num_l1_txs: u64 = 0;
+    let mut num_l2_txs: u64 = 0;
+    for block in &input.blocks {
+        for tx in &block.transactions {
+            if tx.is_l1_tx {
+                if let Some(h) = &tx.l1_tx_hash { l1_tx_hashes.push(*h); }
+                num_l1_txs += 1;
+            } else if tx.tx_type != 0x7e {
+                num_l2_txs += 1;
+            }
+        }
+    }
+    for br in &output.block_results {
+        for log in &br.l2_to_l1_logs {
+            l2_to_l1_encoded_logs.push(log.encode());
+        }
+    }
+    let priority_ops_hash = commitment::priority_ops_rolling_hash(&l1_tx_hashes);
+    let l2_logs_local_root = commitment::l2_to_l1_logs_root(&l2_to_l1_encoded_logs);
+    let effective_multichain_root = if input.protocol_version_minor >= 31 {
+        meta.multichain_root
+    } else {
+        B256::ZERO
+    };
+    let l2_logs_root_hash = commitment::keccak_two(&l2_logs_local_root, &effective_multichain_root);
+    let da_commitment = match meta.da_commitment_scheme {
+        0 | 1 => B256::ZERO,
+        2 | 3 => commitment::da_commitment_calldata(&meta.pubdata),
+        4 => commitment::da_commitment_blobs(&meta.blob_versioned_hashes),
+        _ => panic!("unsupported DA scheme"),
+    };
+    let batch_hash = if input.protocol_version_minor >= 31 {
+        commitment::batch_output_hash_v31(
+            input.chain_id, input.blocks.first().unwrap().timestamp,
+            last_block.timestamp, meta.da_commitment_scheme, &da_commitment,
+            num_l1_txs, num_l2_txs, &priority_ops_hash, &l2_logs_root_hash,
+            &meta.upgrade_tx_hash, &B256::ZERO, meta.sl_chain_id,
+        )
+    } else {
+        commitment::batch_output_hash_v30(
+            input.chain_id, input.blocks.first().unwrap().timestamp,
+            last_block.timestamp, meta.da_commitment_scheme, &da_commitment,
+            num_l1_txs, &priority_ops_hash, &l2_logs_root_hash,
+            &meta.upgrade_tx_hash, &B256::ZERO,
+        )
+    };
+    let commitment = commitment::batch_public_input_hash(&state_before, &state_after, &batch_hash);
+    (output, commitment, state_before, state_after, batch_hash)
 }
 
 /// Execute a single block with proof-verified state reads.
@@ -388,20 +508,28 @@ fn execute_block_proven(
     // For L2 txs, the hash comes from signed_tx_bytes (keccak256(signed_bytes)).
     // For L1 txs, it comes from l1_tx_hash.
     let tx_hashes: Vec<B256> = block.transactions.iter().map(|tx| {
-        if let Some(ref signed) = tx.signed_tx_bytes {
+        let hash = if let Some(ref signed) = tx.signed_tx_bytes {
             alloy_primitives::keccak256(signed)
         } else if let Some(hash) = tx.l1_tx_hash {
             hash
+        } else if tx.tx_type == 0x7e {
+            batch_meta.upgrade_tx_hash
         } else {
-            // Fallback: hash the tx fields deterministically
-            // This shouldn't happen in proven mode (L2 txs have signed_bytes)
             B256::ZERO
-        }
+        };
+        hash
     }).collect();
     let tx_root = commitment::transactions_rolling_hash(&tx_hashes);
+    if trace_enabled() {
+        for (i, h) in tx_hashes.iter().enumerate() {
+            eprintln!("TRACE tx_hash[{i}]: {h}");
+        }
+        eprintln!("TRACE tx_root: {tx_root}");
+        eprintln!("TRACE total_gas: {total_gas_used}");
+    }
 
     // Get parent hash from block_hashes (previous block's hash)
-    let parent_hash = if block.number > 1 {
+    let parent_hash = if block.number >= 1 {
         block.block_hashes.iter()
             .find(|(n, _)| *n == block.number - 1)
             .map(|(_, h)| *h)
@@ -409,6 +537,11 @@ fn execute_block_proven(
     } else {
         B256::ZERO
     };
+    if trace_enabled() {
+        eprintln!("TRACE parent_hash for block {}: {parent_hash}", block.number);
+        eprintln!("TRACE prev_randao: {}", block.prev_randao);
+        eprintln!("TRACE coinbase: {}", block.coinbase);
+    }
 
     let computed_header_hash = block_header::compute_block_header_hash(
         &parent_hash,
@@ -523,7 +656,7 @@ fn build_proven_db(block: &BlockInput, expected_root: &B256, batch_meta: &BatchM
         );
     }
 
-    // Verify bytecodes: keccak256(code) must equal the provided hash
+    // Verify bytecodes: keccak256(code) must equal the provided hash.
     let mut bytecodes = HashMap::new();
     for (hash, code) in &block.bytecodes {
         let computed_hash = alloy_primitives::keccak256(code);
@@ -531,6 +664,10 @@ fn build_proven_db(block: &BlockInput, expected_root: &B256, batch_meta: &BatchM
             computed_hash, *hash,
             "bytecode hash mismatch: computed {computed_hash}, provided {hash}"
         );
+        bytecodes.insert(*hash, Bytecode::new_raw(Bytes::copy_from_slice(code)));
+    }
+    // Force-deploy bytecodes keyed by ZKsync blake2s hash (includes artifacts).
+    for (hash, code) in &block.force_deploy_bytecodes {
         bytecodes.insert(*hash, Bytecode::new_raw(Bytes::copy_from_slice(code)));
     }
 
@@ -562,6 +699,33 @@ fn build_proven_db(block: &BlockInput, expected_root: &B256, batch_meta: &BatchM
             }
         }
         block_hashes.insert(num, hash);
+    }
+
+    // For accounts not in account_preimages (no merkle proof), fall back to
+    // block.accounts data. Skip accounts with non-zero code_hash that have
+    // force_deploy_bytecodes — these will be deployed by the upgrade tx and
+    // must start with empty code for the deployment check to work.
+    let has_force_deploys = !block.force_deploy_bytecodes.is_empty();
+    for (addr, data) in &block.accounts {
+        if verified_accounts.contains_key(addr) { continue; }
+        // If this block has force deployments and this account has code,
+        // skip it — the upgrade code will deploy it and checks code.length == 0.
+        if has_force_deploys && !data.code_hash.is_zero() {
+            continue;
+        }
+        let code_hash = if data.code_hash.is_zero() {
+            if data.nonce == 0 && data.balance.is_zero() { continue; }
+            KECCAK_EMPTY
+        } else {
+            data.code_hash
+        };
+        verified_accounts.insert(*addr, AccountInfo {
+            nonce: data.nonce,
+            balance: data.balance,
+            code_hash,
+            code: None,
+            account_id: None,
+        });
     }
 
     ProvenDB {
@@ -599,6 +763,8 @@ fn build_proven_tx(input: &TxInput) -> ZKsyncTx<TxEnv> {
         // L1 tx hashes are canonical priority queue hashes, not keccak256(raw_bytes).
         // They are verified via priority_operations_rolling_hash in the batch commitment,
         // not via raw hash comparison here.
+    } else if input.tx_type == 0x7e {
+        // Upgrade txs don't have signed bytes — they're system txs verified by the L1 protocol.
     } else {
         // L2 transactions MUST have signed_tx_bytes for signature verification.
         let signed_bytes = input.signed_tx_bytes.as_ref().unwrap_or_else(|| {
@@ -616,7 +782,11 @@ fn build_proven_tx(input: &TxInput) -> ZKsyncTx<TxEnv> {
         );
     }
 
-    build_tx_inner(input, false)
+    // For upgrade txs (0x7e), allow gas_used_override even in proven mode.
+    // EVM gas metering differs from ZKsync OS native gas, so the server's gas_used
+    // must be used for the block header / commitment computation.
+    let allow_gas_override = input.tx_type == 0x7e;
+    build_tx_inner(input, allow_gas_override)
 }
 
 /// Build a transaction for unverified (testing) execution.
@@ -631,9 +801,17 @@ fn build_tx_inner(input: &TxInput, allow_overrides: bool) -> ZKsyncTx<TxEnv> {
         None => TxKind::Create,
     };
 
+    // For upgrade transactions (0x7e), use unlimited gas since EVM gas metering
+    // differs from ZKsync OS native gas. The actual gas is handled by gas_used_override.
+    let effective_gas_limit = if input.tx_type == 0x7e {
+        input.gas_limit.saturating_mul(10) // 200x gas for upgrade txs (EVM gas >> ZKsync native gas)
+    } else {
+        input.gas_limit
+    };
+
     let mut builder = TxEnv::builder()
         .caller(input.caller)
-        .gas_limit(input.gas_limit)
+        .gas_limit(effective_gas_limit)
         .gas_price(input.gas_price)
         .kind(kind)
         .value(input.value)
@@ -727,16 +905,34 @@ impl core::fmt::Display for SimpleDBError {
 impl std::error::Error for SimpleDBError {}
 impl DBErrorMarker for SimpleDBError {}
 
+/// Enable REVM execution tracing via environment variable TRACE_REVM=1
+fn trace_enabled() -> bool {
+    std::env::var("TRACE_REVM").map(|v| v == "1").unwrap_or(false)
+}
+
 impl DatabaseRef for SimpleDB {
     type Error = SimpleDBError;
     fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
-        Ok(self.accounts.get(&address).cloned())
+        let result = self.accounts.get(&address).cloned();
+        if trace_enabled() {
+            let has_code = result.as_ref().map(|a| a.code_hash != KECCAK_EMPTY && a.code_hash != B256::ZERO).unwrap_or(false);
+            if result.is_some() && has_code {
+                eprintln!("TRACE basic_ref({address}) → has_code");
+            } else if result.is_none() {
+                eprintln!("TRACE basic_ref({address}) → NOT_FOUND");
+            }
+        }
+        Ok(result)
     }
     fn code_by_hash_ref(&self, code_hash: B256) -> Result<Bytecode, Self::Error> {
         Ok(self.bytecodes.get(&code_hash).cloned().unwrap_or_default())
     }
     fn storage_ref(&self, address: Address, index: U256) -> Result<U256, Self::Error> {
-        Ok(self.storage.get(&(address, index)).copied().unwrap_or_default())
+        let result = self.storage.get(&(address, index)).copied().unwrap_or_default();
+        if trace_enabled() && !result.is_zero() {
+            eprintln!("TRACE storage_ref({address}, slot={index}) → {result}");
+        }
+        Ok(result)
     }
     fn block_hash_ref(&self, number: u64) -> Result<B256, Self::Error> {
         Ok(self.block_hashes.get(&number).copied().unwrap_or_default())
@@ -761,16 +957,13 @@ fn build_simple_db(block: &BlockInput) -> SimpleDB {
     let mut bytecodes = HashMap::new();
     for (hash, code) in &block.bytecodes {
         let bytecode = Bytecode::new_raw(Bytes::copy_from_slice(code));
-        // Store under the original key (keccak256 observable hash)
-        bytecodes.insert(*hash, bytecode.clone());
-        // Also store under blake2s256 hash for deployer precompile compatibility.
-        // The deployer precompile looks up by blake2s256(padded_code), not keccak256(raw_code).
-        use blake2::{Blake2s256, Digest};
-        let padded_len = (code.len() + 31) / 32 * 32; // pad to 32-byte boundary
-        let mut padded = vec![0u8; padded_len];
-        padded[..code.len()].copy_from_slice(code);
-        let blake2_hash = B256::from_slice(&Blake2s256::digest(&padded));
-        bytecodes.insert(blake2_hash, bytecode);
+        bytecodes.insert(*hash, bytecode);
+    }
+    // Force-deploy bytecodes keyed by ZKsync blake2s hash (includes artifacts).
+    // The deployer precompile looks up by this hash.
+    for (hash, code) in &block.force_deploy_bytecodes {
+        let bytecode = Bytecode::new_raw(Bytes::copy_from_slice(code));
+        bytecodes.insert(*hash, bytecode);
     }
     let mut block_hashes = HashMap::new();
     for &(num, hash) in &block.block_hashes {
@@ -818,6 +1011,16 @@ where
         };
         match evm.transact_commit(tx) {
             Ok(result) => {
+                if tx_input.tx_type == 0x7e {
+                    let output_hex = result.output().map(|b| {
+                        let hex_str: String = b.iter().take(64).map(|byte| format!("{:02x}", byte)).collect();
+                        if b.len() > 64 { format!("{hex_str}...({}bytes)", b.len()) } else { hex_str }
+                    }).unwrap_or_default();
+                    eprintln!(
+                        "DEBUG upgrade tx: success={}, gas_used={}, allow_overrides={}, output={}",
+                        result.is_success(), result.gas_used(), allow_overrides, output_hex,
+                    );
+                }
                 tx_results.push(TxOutput {
                     success: result.is_success(),
                     gas_used: result.gas_used(),

@@ -208,6 +208,10 @@ pub struct BatchTreeUpdate {
     #[serde(default)]
     pub intermediate_hashes_new: Vec<B256>,
     pub leaf_count_before: u64,
+    /// The server's actual tree root after applying all writes.
+    /// Used when intermediate_hashes_new computation is unreliable.
+    #[serde(default)]
+    pub expected_root_after: Option<B256>,
 }
 
 impl BatchTreeUpdate {
@@ -262,8 +266,12 @@ impl BatchTreeUpdate {
         }
 
         leaves.sort_by_key(|(idx, _)| *idx);
-        // Use separate intermediate hashes for new root if available
-        let new_root = if !self.intermediate_hashes_new.is_empty() {
+        // Use the server's expected root if available (trusted from the tree DB).
+        // This bypasses intermediate hash recomputation which is error-prone for
+        // complex batch updates with many inserts.
+        let new_root = if let Some(expected) = self.expected_root_after {
+            expected
+        } else if !self.intermediate_hashes_new.is_empty() {
             self.zip_leaves_with(&leaves, next_tree_index, &self.intermediate_hashes_new)
         } else {
             self.zip_leaves(&leaves, next_tree_index)

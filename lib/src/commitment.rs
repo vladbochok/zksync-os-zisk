@@ -56,6 +56,8 @@ pub fn state_commitment_hash(
 /// Blake2s256(block_hash[1] || block_hash[2] || ... || block_hash[255] || current_block_hash)
 /// where block_hash[i] are the previous 255 block hashes (index 1..=255 of the 256-entry array).
 pub fn block_hashes_blake(previous_255_hashes: &[B256], current_block_hash: &B256) -> B256 {
+    // Match Airbender: block_hashes.0.iter().skip(1) then current.
+    // Order: [block_hashes[1], ..., block_hashes[255], current_block_hash]
     let mut h = Blake2s256::new();
     for hash in previous_255_hashes {
         h.update(hash.as_slice());
