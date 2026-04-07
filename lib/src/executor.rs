@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use revm::context::TxEnv;
 use revm::database::CacheDB;
 use revm::database_interface::DBErrorMarker;
-use revm::primitives::{Address, B256, Bytes, TxKind, U256, KECCAK_EMPTY};
+use revm::primitives::{Address, B256, Bytes, TxKind, U256, KECCAK_EMPTY, address};
 use revm::state::{AccountInfo, Bytecode};
 use revm::{DatabaseRef, ExecuteCommitEvm};
 use zksync_os_revm::transaction::abstraction::ZKsyncTxBuilder;
@@ -464,7 +464,7 @@ fn execute_block_proven(
 ) -> BlockResult {
     let proven_db = build_proven_db(block, expected_root, batch_meta);
     let cache_db = CacheDB::new(proven_db);
-    let (tx_results, storage_diffs, account_diffs) =
+    let (tx_results, storage_diffs, account_diffs, computed_l2_to_l1_logs) =
         run_evm_and_collect_diffs(chain_id, spec_id, block, cache_db, false);
     // In proven mode, verify every account that changed state has a verified
     // "before" value. If an account's nonce/balance changed, its "before"
@@ -558,13 +558,39 @@ fn execute_block_proven(
         );
     }
 
+    // SOUND: L2→L1 logs are computed from REVM's EVM execution output, NOT from
+    // the untrusted BlockInput.l2_to_l1_logs. The L1Messenger precompile (0x8008)
+    // emits L1MessageSent EVM events during execution; we reconstruct the structured
+    // L2ToL1LogEntry from those events. This ensures the logs in the batch commitment
+    // match what was actually executed.
+    //
+    // Verify consistency: computed logs must match input logs. A mismatch means either
+    // the server provided wrong logs or our extraction has a bug.
+    if !block.l2_to_l1_logs.is_empty() || !computed_l2_to_l1_logs.is_empty() {
+        assert_eq!(
+            computed_l2_to_l1_logs.len(),
+            block.l2_to_l1_logs.len(),
+            "L2→L1 log count mismatch: computed {} from EVM, input has {}",
+            computed_l2_to_l1_logs.len(),
+            block.l2_to_l1_logs.len(),
+        );
+        for (i, (computed, input)) in computed_l2_to_l1_logs.iter().zip(&block.l2_to_l1_logs).enumerate() {
+            assert_eq!(
+                computed.encode(),
+                input.encode(),
+                "L2→L1 log {i} mismatch: computed {:?} != input {:?}",
+                computed, input,
+            );
+        }
+    }
+
     BlockResult {
         block_number: block.number,
         computed_block_header_hash: computed_header_hash,
         tx_results,
         storage_diffs,
         account_diffs,
-        l2_to_l1_logs: block.l2_to_l1_logs.clone(),
+        l2_to_l1_logs: computed_l2_to_l1_logs,
     }
 }
 
@@ -971,13 +997,90 @@ fn build_simple_db(block: &BlockInput) -> SimpleDB {
 // Shared EVM execution and diff collection
 // ---------------------------------------------------------------------------
 
+/// L1Messenger system contract address (0x8008).
+const L1_MESSENGER_ADDRESS: Address = address!("0000000000000000000000000000000000008008");
+
+/// L1MessageSent event topic: keccak256("L1MessageSent(address,bytes32,bytes)")
+const L1_MESSAGE_SENT_TOPIC: B256 = B256::new([
+    0x3a, 0x36, 0xe4, 0x72, 0x91, 0xf4, 0x20, 0x1f, 0xaf, 0x13, 0x7f, 0xab, 0x08, 0x1d, 0x92, 0x29,
+    0x5b, 0xce, 0x2d, 0x53, 0xbe, 0x2c, 0x6c, 0xa6, 0x8b, 0xa8, 0x2c, 0x7f, 0xaa, 0x9c, 0xe2, 0x41,
+]);
+
+/// Bootloader formal address — used as sender for L1→L2 tx status logs.
+const BOOTLOADER_ADDRESS: Address = address!("0000000000000000000000000000000000008001");
+
+/// Extract L2→L1 logs from EVM execution output.
+///
+/// The L1Messenger precompile (0x8008) emits standard EVM logs with the
+/// `L1MessageSent(address,bytes32,bytes)` topic. This function reconstructs
+/// the ZKsync L2→L1 log entries from those EVM logs.
+///
+/// For L1→L2 priority transactions, the bootloader emits a status log
+/// (success/failure) — these are synthesized from the tx result + l1_tx_hash.
+fn extract_l2_to_l1_logs_from_evm(
+    evm_logs: &[revm::primitives::Log],
+    tx_number_in_block: u16,
+    tx_input: &TxInput,
+    tx_success: bool,
+) -> Vec<L2ToL1LogEntry> {
+    let mut logs = Vec::new();
+
+    // 1. For L1→L2 priority transactions, the bootloader emits a status log.
+    //    sender=BOOTLOADER(0x8001), key=l2_tx_hash, value=success_flag
+    if tx_input.is_l1_tx {
+        if let Some(l1_hash) = &tx_input.l1_tx_hash {
+            logs.push(L2ToL1LogEntry {
+                l2_shard_id: 0,
+                is_service: true,
+                tx_number_in_block,
+                sender: BOOTLOADER_ADDRESS,
+                key: *l1_hash,
+                value: if tx_success {
+                    let mut v = B256::ZERO;
+                    v.0[31] = 1;
+                    v
+                } else {
+                    B256::ZERO
+                },
+            });
+        }
+    }
+
+    // 2. Extract L1Messenger.sendToL1() logs from EVM log events.
+    //    The precompile emits: Log { address: 0x8008, topics: [L1_MESSAGE_SENT_TOPIC, caller_padded, message_hash], data: abi_encoded_message }
+    //    Reconstruct: sender=0x8008, key=caller_padded, value=message_hash
+    for log in evm_logs {
+        if log.address != L1_MESSENGER_ADDRESS {
+            continue;
+        }
+        let topics = log.data.topics();
+        if topics.is_empty() || topics[0] != L1_MESSAGE_SENT_TOPIC {
+            continue;
+        }
+        if topics.len() < 3 {
+            continue;
+        }
+
+        logs.push(L2ToL1LogEntry {
+            l2_shard_id: 0,
+            is_service: true,
+            tx_number_in_block,
+            sender: L1_MESSENGER_ADDRESS,
+            key: topics[1],       // caller address (left-padded to B256)
+            value: topics[2],     // keccak256(message)
+        });
+    }
+
+    logs
+}
+
 fn run_evm_and_collect_diffs<DB: DatabaseRef>(
     chain_id: u64,
     spec_id: ZkSpecId,
     block: &BlockInput,
     mut cache_db: CacheDB<DB>,
     allow_overrides: bool,
-) -> (Vec<TxOutput>, Vec<StorageDiff>, Vec<AccountDiff>)
+) -> (Vec<TxOutput>, Vec<StorageDiff>, Vec<AccountDiff>, Vec<L2ToL1LogEntry>)
 where
     DB::Error: core::fmt::Debug,
 {
@@ -998,7 +1101,9 @@ where
         .build_zk();
 
     let mut tx_results = Vec::with_capacity(block.transactions.len());
-    for tx_input in &block.transactions {
+    let mut computed_l2_to_l1_logs = Vec::new();
+
+    for (tx_idx, tx_input) in block.transactions.iter().enumerate() {
         let tx = if allow_overrides {
             build_tx(tx_input)
         } else {
@@ -1006,8 +1111,17 @@ where
         };
         match evm.transact_commit(tx) {
             Ok(result) => {
+                let tx_number = tx_idx as u16;
+                let success = result.is_success();
+                let evm_logs = result.logs();
+
+                // Extract L2→L1 logs from EVM output — computed, not from input
+                computed_l2_to_l1_logs.extend(
+                    extract_l2_to_l1_logs_from_evm(evm_logs, tx_number, tx_input, success)
+                );
+
                 tx_results.push(TxOutput {
-                    success: result.is_success(),
+                    success,
                     gas_used: result.gas_used(),
                     output: result.output().map(|b| b.to_vec()).unwrap_or_default(),
                 });
@@ -1083,21 +1197,28 @@ where
         }
     }
 
-    (tx_results, storage_diffs, account_diffs)
+    (tx_results, storage_diffs, account_diffs, computed_l2_to_l1_logs)
 }
 
 fn execute_block_unverified(chain_id: u64, spec_id: ZkSpecId, block: &BlockInput) -> BlockResult {
     let db = build_simple_db(block);
     let cache_db = CacheDB::new(db);
-    let (tx_results, storage_diffs, account_diffs) =
+    let (tx_results, storage_diffs, account_diffs, computed_logs) =
         run_evm_and_collect_diffs(chain_id, spec_id, block, cache_db, true);
+    // Unverified mode: use computed logs (from EVM execution) if available,
+    // fall back to input logs for backward compat with inputs that lack EVM log data.
+    let l2_to_l1_logs = if computed_logs.is_empty() {
+        block.l2_to_l1_logs.clone()
+    } else {
+        computed_logs
+    };
     BlockResult {
         block_number: block.number,
         computed_block_header_hash: block.block_header_hash, // unverified path trusts input
         tx_results,
         storage_diffs,
         account_diffs,
-        l2_to_l1_logs: block.l2_to_l1_logs.clone(),
+        l2_to_l1_logs,
     }
 }
 

@@ -140,7 +140,7 @@ pub struct TxInput {
 }
 
 /// L2->L1 log entry.
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct L2ToL1LogEntry {
     pub l2_shard_id: u8,
     pub is_service: bool,
