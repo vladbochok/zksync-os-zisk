@@ -997,93 +997,8 @@ fn build_simple_db(block: &BlockInput) -> SimpleDB {
 // Shared EVM execution and diff collection
 // ---------------------------------------------------------------------------
 
-/// L1Messenger system contract address (0x8008).
-const L1_MESSENGER_ADDRESS: Address = address!("0000000000000000000000000000000000008008");
-
-/// L1MessageSent event topic: keccak256("L1MessageSent(address,bytes32,bytes)")
-const L1_MESSAGE_SENT_TOPIC: B256 = B256::new([
-    0x3a, 0x36, 0xe4, 0x72, 0x91, 0xf4, 0x20, 0x1f, 0xaf, 0x13, 0x7f, 0xab, 0x08, 0x1d, 0x92, 0x29,
-    0x5b, 0xce, 0x2d, 0x53, 0xbe, 0x2c, 0x6c, 0xa6, 0x8b, 0xa8, 0x2c, 0x7f, 0xaa, 0x9c, 0xe2, 0x41,
-]);
-
 /// Bootloader formal address — used as sender for L1→L2 tx status logs.
 const BOOTLOADER_ADDRESS: Address = address!("0000000000000000000000000000000000008001");
-
-/// Extract L2→L1 logs from EVM execution output.
-///
-/// ZKsync OS produces exactly two kinds of L2→L1 logs:
-///
-/// 1. **User messages** from `L1Messenger.sendToL1()`: The precompile at 0x8008
-///    emits an EVM log with topic `L1MessageSent(address,bytes32,bytes)`.
-///    Reconstructed as: sender=0x8008, key=caller_padded, value=keccak(message).
-///
-/// 2. **L1→L2 tx status** from the bootloader: After each priority transaction,
-///    a log records whether execution succeeded. Synthesized from tx metadata:
-///    sender=0x8001, key=l1_tx_hash, value=success_flag.
-///
-/// This covers all L2→L1 log types in the current protocol. System contracts
-/// (Compressor, KnownCodesStorage, L2BaseToken) call `sendToL1()` which goes
-/// through case 1. No contract calls `sendL2ToL1Log()` directly.
-///
-/// SAFETY: The proven path asserts that computed logs match input logs.
-/// If the protocol adds new log types, this assertion will catch the mismatch
-/// and the function must be extended.
-fn extract_l2_to_l1_logs_from_evm(
-    evm_logs: &[revm::primitives::Log],
-    tx_number_in_block: u16,
-    tx_input: &TxInput,
-    tx_success: bool,
-) -> Vec<L2ToL1LogEntry> {
-    let mut logs = Vec::new();
-
-    // 1. For L1→L2 priority transactions, the bootloader emits a status log.
-    //    sender=BOOTLOADER(0x8001), key=l2_tx_hash, value=success_flag
-    if tx_input.is_l1_tx {
-        if let Some(l1_hash) = &tx_input.l1_tx_hash {
-            logs.push(L2ToL1LogEntry {
-                l2_shard_id: 0,
-                is_service: true,
-                tx_number_in_block,
-                sender: BOOTLOADER_ADDRESS,
-                key: *l1_hash,
-                value: if tx_success {
-                    let mut v = B256::ZERO;
-                    v.0[31] = 1;
-                    v
-                } else {
-                    B256::ZERO
-                },
-            });
-        }
-    }
-
-    // 2. Extract L1Messenger.sendToL1() logs from EVM log events.
-    //    The precompile emits: Log { address: 0x8008, topics: [L1_MESSAGE_SENT_TOPIC, caller_padded, message_hash], data: abi_encoded_message }
-    //    Reconstruct: sender=0x8008, key=caller_padded, value=message_hash
-    for log in evm_logs {
-        if log.address != L1_MESSENGER_ADDRESS {
-            continue;
-        }
-        let topics = log.data.topics();
-        if topics.is_empty() || topics[0] != L1_MESSAGE_SENT_TOPIC {
-            continue;
-        }
-        if topics.len() < 3 {
-            continue;
-        }
-
-        logs.push(L2ToL1LogEntry {
-            l2_shard_id: 0,
-            is_service: true,
-            tx_number_in_block,
-            sender: L1_MESSENGER_ADDRESS,
-            key: topics[1],       // caller address (left-padded to B256)
-            value: topics[2],     // keccak256(message)
-        });
-    }
-
-    logs
-}
 
 fn run_evm_and_collect_diffs<DB: DatabaseRef>(
     chain_id: u64,
@@ -1095,6 +1010,9 @@ fn run_evm_and_collect_diffs<DB: DatabaseRef>(
 where
     DB::Error: core::fmt::Debug,
 {
+    // Clear any stale L2→L1 logs from previous executions on this thread.
+    zksync_os_revm::l2_to_l1_logs::clear_logs();
+
     let mut evm = <ZkContext<_>>::default()
         .with_db(&mut cache_db)
         .modify_cfg_chained(|cfg| {
@@ -1115,6 +1033,11 @@ where
     let mut computed_l2_to_l1_logs = Vec::new();
 
     for (tx_idx, tx_input) in block.transactions.iter().enumerate() {
+        let tx_number = tx_idx as u16;
+
+        // Tell the L1Messenger precompile which tx number we're executing.
+        zksync_os_revm::l2_to_l1_logs::set_tx_number(tx_number);
+
         let tx = if allow_overrides {
             build_tx(tx_input)
         } else {
@@ -1122,14 +1045,42 @@ where
         };
         match evm.transact_commit(tx) {
             Ok(result) => {
-                let tx_number = tx_idx as u16;
                 let success = result.is_success();
-                let evm_logs = result.logs();
 
-                // Extract L2→L1 logs from EVM output — computed, not from input
-                computed_l2_to_l1_logs.extend(
-                    extract_l2_to_l1_logs_from_evm(evm_logs, tx_number, tx_input, success)
-                );
+                // For L1→L2 priority txs, synthesize the bootloader status log.
+                // This log is emitted by the bootloader (not via L1Messenger precompile),
+                // so it doesn't go through the thread-local path.
+                if tx_input.is_l1_tx {
+                    if let Some(l1_hash) = &tx_input.l1_tx_hash {
+                        computed_l2_to_l1_logs.push(L2ToL1LogEntry {
+                            l2_shard_id: 0,
+                            is_service: true,
+                            tx_number_in_block: tx_number,
+                            sender: BOOTLOADER_ADDRESS,
+                            key: *l1_hash,
+                            value: if success {
+                                let mut v = B256::ZERO;
+                                v.0[31] = 1;
+                                v
+                            } else {
+                                B256::ZERO
+                            },
+                        });
+                    }
+                }
+
+                // Collect L2→L1 logs recorded by the L1Messenger precompile
+                // during this transaction's execution.
+                for log in zksync_os_revm::l2_to_l1_logs::take_logs() {
+                    computed_l2_to_l1_logs.push(L2ToL1LogEntry {
+                        l2_shard_id: log.l2_shard_id,
+                        is_service: log.is_service,
+                        tx_number_in_block: log.tx_number_in_block,
+                        sender: log.sender,
+                        key: log.key,
+                        value: log.value,
+                    });
+                }
 
                 tx_results.push(TxOutput {
                     success,
