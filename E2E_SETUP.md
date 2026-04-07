@@ -19,10 +19,6 @@ rustup install nightly-2026-02-10
 curl -L https://raw.githubusercontent.com/0xPolygonHermez/zisk/main/ziskup/install.sh | bash
 source ~/.bashrc
 
-# Foundry (for Solidity tests)
-curl -L https://foundry.paradigm.xyz | bash
-source ~/.bashrc
-foundryup
 ```
 
 ## Step 2: Clone repositories
@@ -95,8 +91,8 @@ After the full pipeline completes, collect these artifacts:
 #    Printed during rom-setup: "Root hash: [a, b, c, d]"
 #    This is what identifies this specific ZiSK guest binary
 
-# 2. rootCVadcopFinal — hardcoded in ZiskVerifier.sol
-#    Already set in contracts/src/ZiskVerifier.sol getRootCVadcopFinal()
+# 2. rootCVadcopFinal — from SNARK setup
+#    Stored in ~/.zisk/provingKeySnark/vadcop_final.verkey.json
 
 # 3. SNARK proof bytes — from the stage 7 output
 ls /tmp/zisk_e2e/snark_proof/
@@ -105,14 +101,23 @@ ls /tmp/zisk_e2e/snark_proof/
 #    Committed by the guest via ziskos::io::commit()
 ```
 
-## Step 6: Run Solidity verification with real proof
+## Step 6: Update and verify on-chain verifier
 
-Once you have the SNARK proof from stage 7, create a Foundry test that calls:
-```solidity
-verifier.verifySnarkProof(programVK, rootCVadcopFinal, publicValues, proofBytes)
+Once you have the SNARK proof from stage 7, update the ZiSK verifier in era-contracts:
+
+```bash
+cd ~/zksync-os-second-proof-system/era-contracts/tools/verifier-gen
+
+# Update ZiSK_vk.json with new programVK (from rom-setup output)
+# Then regenerate:
+cargo run --release -- --variant zisk
+
+# Copy to contracts dir:
+cp data/ZiskVerifier.sol ../../l1-contracts/contracts/state-transition/verifiers/
+
+# Run verifier tests:
+cd ../../l1-contracts && forge test --match-contract MultiProofVerifier
 ```
-
-The test in `contracts/test/ZiskVerifierTest.t.sol` already has the structure — you need to fill in real `programVK`, `publicValues`, and `proofBytes` from the proof output.
 
 ## What to verify at each stage
 
@@ -120,7 +125,7 @@ The test in `contracts/test/ZiskVerifierTest.t.sol` already has the structure �
 - **Stage 5**: "19 AIR proofs saved" + "GENERATING_INNER_PROOFS" completes
 - **Stage 6**: "GENERATING_INNER_PROOFS" + aggregation + compression completes without OOM
 - **Stage 7**: SNARK proof file generated
-- **Stage 8**: `forge test` passes with real proof data
+- **Stage 8**: era-contracts `forge test --match-contract MultiProofVerifier` passes
 
 ## Troubleshooting
 

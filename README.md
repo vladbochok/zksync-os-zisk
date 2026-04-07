@@ -35,7 +35,7 @@ of state transitions.
 | `lib/` | Shared Rust library — REVM executor, merkle proof verification, batch commitment hashing, types. Used by guest, host, and the server. |
 | `guest/` | ZiSK guest binary — compiled to RV64IMA ELF, runs inside the prover. Reads `BatchInput`, executes with proof verification, commits the batch hash. |
 | `host/` | Native CLI tool — `sample` (generate test input), `execute` (run REVM without proofs), `prepare` (convert JSON to ZiSK binary format). |
-| `contracts/` | Solidity verifier — on-chain SNARK verification of the ZiSK proof's public output against the batch commitment. |
+Solidity verifiers (`ZiskVerifier.sol`, `ZiskSnarkPlonkVerifier.sol`) live in [era-contracts](https://github.com/vladbochok/era-contracts/tree/vb/zisk-verifier/l1-contracts/contracts/state-transition/verifiers) and are generated via `cargo run -- --variant zisk` in `era-contracts/tools/verifier-gen/`.
 
 ## What the ZiSK Proof Verifies
 
@@ -97,9 +97,6 @@ cargo-zisk verify-constraints -e <elf> -i input.bin
 ## Testing
 
 ```bash
-# Solidity verifier tests
-cd contracts && forge test
-
 # Server integration tests (all 3 ZiSK tests)
 cd ../zksync-os-server
 cargo nextest run -p zksync_os_integration_tests --profile no-pig -E 'test(zisk)'
