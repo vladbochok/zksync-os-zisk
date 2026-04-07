@@ -992,8 +992,8 @@ where
                 let success = result.is_success();
 
                 // For L1→L2 priority txs, synthesize the bootloader status log.
-                // This log is emitted by the bootloader (not via L1Messenger precompile),
-                // so it doesn't go through the thread-local path.
+                // In zksync-os this is emitted by the bootloader via emit_l1_l2_tx_log().
+                // REVM has no bootloader, so we synthesize it from tx metadata.
                 if tx_input.is_l1_tx {
                     if let Some(l1_hash) = &tx_input.l1_tx_hash {
                         computed_l2_to_l1_logs.push(L2ToL1LogEntry {
