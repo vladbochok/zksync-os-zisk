@@ -275,11 +275,6 @@ pub fn execute_and_commit(input: &BatchInput) -> (BatchOutput, B256) {
 
     // Use the COMPUTED block header hash (from execution), not the input's block_header_hash
     let last_block_result = output.block_results.last().unwrap();
-    eprintln!("DEBUG prev_block_hashes count={}, non_zero={}, canonical={}",
-        meta.previous_block_hashes.len(),
-        meta.previous_block_hashes.iter().filter(|h| !h.is_zero()).count(),
-        last_block_result.computed_block_header_hash,
-    );
     let block_hashes_blake_after = commitment::block_hashes_blake(
         &meta.previous_block_hashes,
         &last_block_result.computed_block_header_hash,
@@ -1011,16 +1006,6 @@ where
         };
         match evm.transact_commit(tx) {
             Ok(result) => {
-                if tx_input.tx_type == 0x7e {
-                    let output_hex = result.output().map(|b| {
-                        let hex_str: String = b.iter().take(64).map(|byte| format!("{:02x}", byte)).collect();
-                        if b.len() > 64 { format!("{hex_str}...({}bytes)", b.len()) } else { hex_str }
-                    }).unwrap_or_default();
-                    eprintln!(
-                        "DEBUG upgrade tx: success={}, gas_used={}, allow_overrides={}, output={}",
-                        result.is_success(), result.gas_used(), allow_overrides, output_hex,
-                    );
-                }
                 tx_results.push(TxOutput {
                     success: result.is_success(),
                     gas_used: result.gas_used(),
