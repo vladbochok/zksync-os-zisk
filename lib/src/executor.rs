@@ -59,35 +59,14 @@ impl DatabaseRef for ProvenDB {
     type Error = ProvenDBError;
 
     fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
-        let result = self.verified_accounts.get(&address).cloned();
-        if trace_enabled() {
-            let has_code = result.as_ref().map(|a| a.code_hash != KECCAK_EMPTY && a.code_hash != B256::ZERO).unwrap_or(false);
-            if result.is_none() {
-                eprintln!("TRACE basic({address}) → NONE");
-            } else if has_code {
-                eprintln!("TRACE basic({address}) → code");
-            }
-        }
-        Ok(result)
+        Ok(self.verified_accounts.get(&address).cloned())
     }
 
     fn code_by_hash_ref(&self, code_hash: B256) -> Result<Bytecode, Self::Error> {
-        let result = self.bytecodes.get(&code_hash).cloned().unwrap_or_default();
-        if trace_enabled() && code_hash != KECCAK_EMPTY && code_hash != B256::ZERO && result.is_empty() {
-            eprintln!("TRACE code_by_hash({code_hash}) → EMPTY");
-        }
-        Ok(result)
+        Ok(self.bytecodes.get(&code_hash).cloned().unwrap_or_default())
     }
 
     fn storage_ref(&self, address: Address, index: U256) -> Result<U256, Self::Error> {
-        if trace_enabled() {
-            // Count total storage reads to detect loops
-            static STORAGE_READ_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let count = STORAGE_READ_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if count % 1000 == 0 && count > 0 {
-                eprintln!("TRACE storage_reads={count} addr={address} slot={index}");
-            }
-        }
         let addr_bytes: [u8; 20] = address.into_array();
         let slot = B256::from(index.to_be_bytes::<32>());
         let flat_key = merkle::derive_flat_storage_key(&addr_bytes, &slot);
@@ -113,9 +92,6 @@ impl DatabaseRef for ProvenDB {
             self.verified_storage.borrow_mut().insert(flat_key, value);
             Ok(value.map(|v| U256::from_be_bytes(v.0)).unwrap_or_default())
         } else {
-            if trace_enabled() {
-                eprintln!("TRACE storage({address}, {index}) → NO_PROOF flat_key={flat_key}");
-            }
             Err(ProvenDBError(format!(
                 "no merkle proof for storage read: address={address}, slot={index}, flat_key={flat_key}"
             )))
@@ -515,13 +491,7 @@ fn execute_block_proven(
         hash
     }).collect();
     let tx_root = commitment::transactions_rolling_hash(&tx_hashes);
-    if trace_enabled() {
-        for (i, h) in tx_hashes.iter().enumerate() {
-            eprintln!("TRACE tx_hash[{i}]: {h}");
-        }
-        eprintln!("TRACE tx_root: {tx_root}");
-        eprintln!("TRACE total_gas: {total_gas_used}");
-    }
+
 
     // Get parent hash from block_hashes (previous block's hash)
     let parent_hash = if block.number >= 1 {
@@ -532,11 +502,7 @@ fn execute_block_proven(
     } else {
         B256::ZERO
     };
-    if trace_enabled() {
-        eprintln!("TRACE parent_hash for block {}: {parent_hash}", block.number);
-        eprintln!("TRACE prev_randao: {}", block.prev_randao);
-        eprintln!("TRACE coinbase: {}", block.coinbase);
-    }
+
 
     let computed_header_hash = block_header::compute_block_header_hash(
         &parent_hash,
@@ -926,34 +892,17 @@ impl core::fmt::Display for SimpleDBError {
 impl std::error::Error for SimpleDBError {}
 impl DBErrorMarker for SimpleDBError {}
 
-/// Enable REVM execution tracing via environment variable TRACE_REVM=1
-fn trace_enabled() -> bool {
-    std::env::var("TRACE_REVM").map(|v| v == "1").unwrap_or(false)
-}
 
 impl DatabaseRef for SimpleDB {
     type Error = SimpleDBError;
     fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
-        let result = self.accounts.get(&address).cloned();
-        if trace_enabled() {
-            let has_code = result.as_ref().map(|a| a.code_hash != KECCAK_EMPTY && a.code_hash != B256::ZERO).unwrap_or(false);
-            if result.is_some() && has_code {
-                eprintln!("TRACE basic_ref({address}) → has_code");
-            } else if result.is_none() {
-                eprintln!("TRACE basic_ref({address}) → NOT_FOUND");
-            }
-        }
-        Ok(result)
+        Ok(self.accounts.get(&address).cloned())
     }
     fn code_by_hash_ref(&self, code_hash: B256) -> Result<Bytecode, Self::Error> {
         Ok(self.bytecodes.get(&code_hash).cloned().unwrap_or_default())
     }
     fn storage_ref(&self, address: Address, index: U256) -> Result<U256, Self::Error> {
-        let result = self.storage.get(&(address, index)).copied().unwrap_or_default();
-        if trace_enabled() && !result.is_zero() {
-            eprintln!("TRACE storage_ref({address}, slot={index}) → {result}");
-        }
-        Ok(result)
+        Ok(self.storage.get(&(address, index)).copied().unwrap_or_default())
     }
     fn block_hash_ref(&self, number: u64) -> Result<B256, Self::Error> {
         Ok(self.block_hashes.get(&number).copied().unwrap_or_default())
