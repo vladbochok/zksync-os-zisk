@@ -959,9 +959,6 @@ fn run_evm_and_collect_diffs<DB: DatabaseRef>(
 where
     DB::Error: core::fmt::Debug,
 {
-    // Scoped log collector — clears on creation, drains per-tx, clears on drop.
-    let mut log_collector = zksync_os_revm::l2_to_l1_logs::LogCollector::new();
-
     let mut evm = <ZkContext<_>>::default()
         .with_db(&mut cache_db)
         .modify_cfg_chained(|cfg| {
@@ -983,7 +980,7 @@ where
 
     for (tx_idx, tx_input) in block.transactions.iter().enumerate() {
         let tx_number = tx_idx as u16;
-        log_collector.set_tx_number(tx_number);
+        evm.0.ctx.chain.set_tx_number(tx_number);
 
         let tx = if allow_overrides {
             build_tx(tx_input)
@@ -1016,8 +1013,8 @@ where
                     }
                 }
 
-                // Collect L2→L1 logs recorded by the L1Messenger precompile.
-                for log in log_collector.take_tx_logs() {
+                // Collect L2→L1 logs from the chain context (set by L1Messenger precompile).
+                for log in evm.0.ctx.chain.take_logs() {
                     computed_l2_to_l1_logs.push(L2ToL1LogEntry {
                         l2_shard_id: log.l2_shard_id,
                         is_service: log.is_service,
