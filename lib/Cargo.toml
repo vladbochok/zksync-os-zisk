@@ -10,7 +10,8 @@ revm = { version = "=34.0.0", default-features = false, features = ["std", "opti
 serde = { version = "1", features = ["derive"] }
 bincode = "1.3"
 alloy-primitives = { version = "1", default-features = false }
-alloy-consensus = { version = "1", default-features = false, features = ["k256"] }
+alloy-consensus = { version = "1", default-features = false, features = ["k256", "crypto-backend"] }
+k256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
 alloy-eips = { version = "1", default-features = false }
 blake2 = "0.10"
 tiny-keccak = { version = "2.0", features = ["keccak"] }
