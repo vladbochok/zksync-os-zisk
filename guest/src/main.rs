@@ -19,5 +19,17 @@ fn main() {
     let batch_input: BatchInput = ziskos::io::read();
     let (_output, commitment) = executor::execute_and_commit(&batch_input);
     let hash_bytes: [u8; 32] = commitment.into();
-    ziskos::io::commit(&hash_bytes);
+
+    // ziskos::io::commit() writes bytes as u32 LE chunks, which swaps each
+    // 4-byte group. Pre-swap so the public values contain the raw keccak256
+    // output that the L1 verifier and Airbender both expect.
+    let mut swapped = [0u8; 32];
+    for i in 0..8 {
+        let o = i * 4;
+        swapped[o] = hash_bytes[o + 3];
+        swapped[o + 1] = hash_bytes[o + 2];
+        swapped[o + 2] = hash_bytes[o + 1];
+        swapped[o + 3] = hash_bytes[o];
+    }
+    ziskos::io::commit(&swapped);
 }
