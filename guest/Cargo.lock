@@ -4914,6 +4914,7 @@ version = "0.1.0"
 dependencies = [
  "alloy-primitives",
  "bincode",
+ "revm",
  "ziskos",
  "zksync-os-zisk-lib",
 ]
@@ -4927,6 +4928,7 @@ dependencies = [
  "alloy-primitives",
  "bincode",
  "blake2",
+ "k256",
  "revm",
  "serde",
  "tiny-keccak",
