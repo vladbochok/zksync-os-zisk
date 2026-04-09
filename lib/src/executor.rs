@@ -27,6 +27,14 @@ use crate::types::*;
 /// Database that verifies every read against a merkle proof.
 /// Values are taken FROM the proofs — there is no separate unverified data path.
 /// Proof results are cached after first verification to avoid re-hashing.
+/// System contract address range — these are precompiles/system contracts
+/// that may not have merkle tree entries. Addresses 0x8000..0x8100.
+fn is_system_address(addr: &Address) -> bool {
+    let bytes = addr.as_slice();
+    // Check if address is in range 0x0000...8000 to 0x0000...8100
+    bytes[..18] == [0u8; 18] && bytes[18] == 0x80 && bytes[19] <= 0xff
+}
+
 struct ProvenDB {
     /// Merkle proofs for storage slots, keyed by flat_storage_key.
     storage_proofs: HashMap<B256, merkle::StorageProof>,
@@ -35,6 +43,9 @@ struct ProvenDB {
     verified_storage: std::cell::RefCell<HashMap<B256, Option<B256>>>,
     /// Account data decoded from account-properties merkle proofs.
     verified_accounts: HashMap<Address, AccountInfo>,
+    /// Cache of on-demand account verification results.
+    /// Populated on first basic_ref call for non-pre-verified accounts.
+    verified_accounts_cache: std::cell::RefCell<HashMap<Address, Option<AccountInfo>>>,
     /// Raw account preimages for on-demand account verification.
     account_preimages: HashMap<Address, Vec<u8>>,
     /// Verified bytecodes: keccak256(code) checked against hash at load time.
@@ -61,67 +72,22 @@ impl DatabaseRef for ProvenDB {
     type Error = ProvenDBError;
 
     fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
-        // First check pre-verified accounts (from preimages in build_proven_db)
+        // Fast path: pre-verified accounts (from preimages in build_proven_db)
         if let Some(info) = self.verified_accounts.get(&address) {
             return Ok(Some(info.clone()));
         }
 
-        // SOUND: for accounts not pre-verified, check the merkle proof on-demand.
-        // A malicious server cannot hide accounts by omitting preimages — we verify
-        // the proof here and panic if the account exists but has no preimage.
-        let addr_bytes: [u8; 20] = address.into_array();
-        let flat_key = merkle::derive_account_properties_key(&addr_bytes);
-        if let Some(proof) = self.storage_proofs.get(&flat_key) {
-            let (root, proven_value) = proof
-                .verify(&flat_key)
-                .map_err(|e| ProvenDBError(format!("account proof failed for {address}: {e}")))?;
-            if root != self.expected_root {
-                return Err(ProvenDBError(format!(
-                    "account proof for {address} recovers wrong root: {root} != {}",
-                    self.expected_root
-                )));
-            }
-            match proven_value {
-                Some(proven_hash) => {
-                    // Account EXISTS in the tree — it MUST have a preimage.
-                    // If we reach here, the server provided a proof but no preimage.
-                    if let Some(preimage) = self.account_preimages.get(&address) {
-                        let computed_hash = merkle::AccountProperties::hash(preimage);
-                        assert_eq!(
-                            computed_hash, proven_hash,
-                            "account preimage hash mismatch for {address}"
-                        );
-                        let props = merkle::AccountProperties::decode(preimage);
-                        Ok(Some(AccountInfo {
-                            nonce: props.nonce,
-                            balance: U256::from_be_bytes(props.balance),
-                            code_hash: if props.bytecode_hash.is_zero() {
-                                KECCAK_EMPTY
-                            } else {
-                                props.bytecode_hash
-                            },
-                            code: None,
-                            account_id: None,
-                        }))
-                    } else {
-                        Err(ProvenDBError(format!(
-                            "account {address} exists in merkle tree (proven_hash={proven_hash}) \
-                             but no preimage provided. The server must include preimages for \
-                             all existing accounts."
-                        )))
-                    }
-                }
-                None => {
-                    // Account proven to NOT exist — return None (empty account)
-                    Ok(None)
-                }
-            }
-        } else {
-            // No proof for this address. This is acceptable for addresses that
-            // are created during execution (e.g., CREATE target) or system addresses
-            // that are accessed but don't exist in the state tree yet.
-            Ok(None)
+        // Check cache (avoid re-verifying proofs on repeated calls)
+        if let Some(cached) = self.verified_accounts_cache.borrow().get(&address) {
+            return Ok(cached.clone());
         }
+
+        // On-demand verification via merkle proof
+        let result = self.verify_account_on_demand(&address)?;
+
+        // Cache the result
+        self.verified_accounts_cache.borrow_mut().insert(address, result.clone());
+        Ok(result)
     }
 
     fn code_by_hash_ref(&self, code_hash: B256) -> Result<Bytecode, Self::Error> {
@@ -166,6 +132,77 @@ impl DatabaseRef for ProvenDB {
             .get(&number)
             .copied()
             .unwrap_or_default())
+    }
+}
+
+impl ProvenDB {
+    /// Verify an account on-demand via merkle proof.
+    /// Returns the account info if the account exists, None if proven non-existent.
+    /// Errors if the account has no proof (unless it's a system address).
+    fn verify_account_on_demand(
+        &self,
+        address: &Address,
+    ) -> Result<Option<AccountInfo>, ProvenDBError> {
+        let addr_bytes: [u8; 20] = address.into_array();
+        let flat_key = merkle::derive_account_properties_key(&addr_bytes);
+
+        if let Some(proof) = self.storage_proofs.get(&flat_key) {
+            let (root, proven_value) = proof
+                .verify(&flat_key)
+                .map_err(|e| ProvenDBError(format!("account proof failed for {address}: {e}")))?;
+            if root != self.expected_root {
+                return Err(ProvenDBError(format!(
+                    "account proof for {address} recovers wrong root: {root} != {}",
+                    self.expected_root
+                )));
+            }
+            match proven_value {
+                Some(proven_hash) => {
+                    // Account EXISTS — must have a preimage
+                    if let Some(preimage) = self.account_preimages.get(address) {
+                        let computed_hash = merkle::AccountProperties::hash(preimage);
+                        assert_eq!(
+                            computed_hash, proven_hash,
+                            "account preimage hash mismatch for {address}"
+                        );
+                        let props = merkle::AccountProperties::decode(preimage);
+                        Ok(Some(AccountInfo {
+                            nonce: props.nonce,
+                            balance: U256::from_be_bytes(props.balance),
+                            code_hash: if props.bytecode_hash.is_zero() {
+                                KECCAK_EMPTY
+                            } else {
+                                props.bytecode_hash
+                            },
+                            code: None,
+                            account_id: None,
+                        }))
+                    } else {
+                        Err(ProvenDBError(format!(
+                            "account {address} exists in merkle tree (hash={proven_hash}) \
+                             but no preimage provided"
+                        )))
+                    }
+                }
+                None => {
+                    // Account proven NON-EXISTENT
+                    Ok(None)
+                }
+            }
+        } else {
+            // No proof for this address.
+            // System addresses (0x8000-0x80ff) are precompiles — no tree entry.
+            // Everything else is an error: the server must provide a proof
+            // (existence or non-existence) for every account REVM accesses.
+            if is_system_address(address) {
+                Ok(None)
+            } else {
+                Err(ProvenDBError(format!(
+                    "no merkle proof for account {address}. The server must provide \
+                     a proof (existence or non-existence) for all accessed accounts."
+                )))
+            }
+        }
     }
 }
 
@@ -768,6 +805,7 @@ fn build_proven_db(block: &BlockInput, expected_root: &B256, batch_meta: &BatchM
         storage_proofs,
         verified_storage: std::cell::RefCell::new(HashMap::new()),
         verified_accounts,
+        verified_accounts_cache: std::cell::RefCell::new(HashMap::new()),
         account_preimages: account_preimages_map,
         bytecodes,
         block_hashes,
@@ -1121,6 +1159,16 @@ where
             })
             .unwrap_or((0, U256::ZERO));
 
+        // Detect any account property change (nonce, balance, or code_hash)
+        let code_hash_before = preimage_map
+            .get(addr)
+            .map(|p| merkle::AccountProperties::decode(p).bytecode_hash)
+            .unwrap_or(B256::ZERO);
+        let code_hash_after = if info.code_hash == KECCAK_EMPTY { B256::ZERO } else { info.code_hash };
+        let account_changed = info.nonce != nonce_before
+            || info.balance != balance_before
+            || code_hash_after != code_hash_before;
+
         if info.nonce != nonce_before || info.balance != balance_before {
             account_diffs.push(AccountDiff {
                 address: *addr,
@@ -1129,22 +1177,48 @@ where
                 balance_before,
                 balance_after: info.balance,
             });
+        }
 
+        if account_changed {
             // Emit the corresponding 0x8003 AccountProperties storage write.
-            // This makes REVM's storage_diffs complete — matching what the
-            // Airbender VM produces — so the SOUND-3 reverse check works
-            // without any special-casing for system/priority txs.
+            // Updates ALL fields (nonce, balance, bytecode_hash, code_len, etc.)
+            // to match what the Airbender VM produces.
             let addr_bytes: [u8; 20] = addr.into_array();
             let new_preimage = if let Some(preimage) = preimage_map.get(addr) {
                 let mut buf = preimage.to_vec();
                 buf.resize(merkle::AccountProperties::ENCODED_SIZE, 0);
+                // Update nonce (bytes 8-16)
                 buf[8..16].copy_from_slice(&info.nonce.to_be_bytes());
+                // Update balance (bytes 16-48)
                 buf[16..48].copy_from_slice(&info.balance.to_be_bytes::<32>());
+                // Update bytecode_hash (bytes 48-80)
+                buf[48..80].copy_from_slice(code_hash_after.as_slice());
+                // Update observable_bytecode_hash (bytes 88-120) — same as bytecode_hash for EVM
+                buf[88..120].copy_from_slice(code_hash_after.as_slice());
+                // Note: unpadded_code_len (80-84) and observable_bytecode_len (120-124)
+                // are kept from the preimage — they reflect the deployed code size
+                // which doesn't change for nonce/balance updates.
+                // For new deployments, the code_len comes from the deployed code.
+                if code_hash_after != code_hash_before {
+                    if let Some(code) = db_account.info.code.as_ref() {
+                        let code_len = code.len() as u32;
+                        buf[80..84].copy_from_slice(&code_len.to_be_bytes());
+                        buf[120..124].copy_from_slice(&code_len.to_be_bytes());
+                    }
+                }
                 buf
             } else {
+                // New account — build from scratch
                 let mut buf = vec![0u8; merkle::AccountProperties::ENCODED_SIZE];
                 buf[8..16].copy_from_slice(&info.nonce.to_be_bytes());
                 buf[16..48].copy_from_slice(&info.balance.to_be_bytes::<32>());
+                buf[48..80].copy_from_slice(code_hash_after.as_slice());
+                buf[88..120].copy_from_slice(code_hash_after.as_slice());
+                if let Some(code) = db_account.info.code.as_ref() {
+                    let code_len = code.len() as u32;
+                    buf[80..84].copy_from_slice(&code_len.to_be_bytes());
+                    buf[120..124].copy_from_slice(&code_len.to_be_bytes());
+                }
                 buf
             };
             let new_hash = merkle::AccountProperties::hash(&new_preimage);
