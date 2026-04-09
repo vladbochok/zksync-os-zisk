@@ -184,18 +184,9 @@ pub fn execute_and_commit(input: &BatchInput) -> (BatchOutput, B256) {
     // SOUND-3: verify tree update entries match what REVM actually computed.
     let last_block = input.blocks.last().unwrap();
 
-    // Check if batch contains system/upgrade/priority transactions.
-    // These produce additional storage writes (via bootloader, system contracts)
-    // that REVM doesn't track, so the tree_update may have extra entries.
-    // Priority L1→L2 txs (0xff/0x71) also produce system contract writes.
-    let has_system_txs = input.blocks.iter().any(|b| {
-        b.transactions.iter().any(|tx| {
-            tx.tx_type == 0x7e  // upgrade
-                || tx.tx_type == 0x7f  // system
-                || tx.tx_type == 0xff  // L1→L2 priority (legacy)
-                || tx.tx_type == 0x71  // L1→L2 priority (EIP-712)
-        })
-    });
+    // Note: system/upgrade/priority transactions produce 0x8003 account-property
+    // writes that REVM doesn't track. These are now verified explicitly in the
+    // reverse SOUND-3 check below (computed from account_diffs + preimages).
 
     let (tree_root_after, new_leaf_count) = if let Some(ref tree_update) = meta.tree_update {
         // Build map of REVM writes: flat_key -> new_value (storage diffs only)
@@ -230,15 +221,78 @@ pub fn execute_and_commit(input: &BatchInput) -> (BatchOutput, B256) {
             );
         }
 
-        // Reverse check: tree_update writes must also be in REVM writes.
-        // Exception: system/upgrade/priority transactions produce additional writes
-        // via bootloader and system contracts that REVM doesn't see.
-        if !has_system_txs {
+        // Reverse check: tree_update writes must also be in REVM writes
+        // OR be verifiable 0x8003 account-property writes.
+        //
+        // System/upgrade/priority txs produce additional writes at address 0x8003
+        // (AccountProperties storage) that REVM doesn't track — REVM tracks
+        // nonce/balance as in-memory AccountDiff, not as 0x8003 storage writes.
+        // Instead of skipping the reverse check entirely, we compute the expected
+        // 0x8003 writes from REVM's account_diffs + verified preimages.
+        {
+            // Compute expected 0x8003 writes from account diffs across all blocks.
+            let mut expected_account_writes: HashMap<B256, B256> = HashMap::new();
+            for (block, block_result) in input.blocks.iter().zip(&output.block_results) {
+                // Build preimage map for this block
+                let preimages: HashMap<Address, &[u8]> = block
+                    .account_preimages
+                    .iter()
+                    .map(|(a, p)| (*a, p.as_slice()))
+                    .collect();
+
+                for diff in &block_result.account_diffs {
+                    if diff.nonce_before == diff.nonce_after
+                        && diff.balance_before == diff.balance_after
+                    {
+                        continue; // no change
+                    }
+                    let addr_bytes: [u8; 20] = diff.address.into_array();
+                    let flat_key = merkle::derive_account_properties_key(&addr_bytes);
+
+                    // Get the preimage (124-byte encoded AccountProperties).
+                    // If no preimage, the account was zero-initialized — build a
+                    // minimal preimage with all-zero fields.
+                    let new_encoded = if let Some(preimage) = preimages.get(&diff.address) {
+                        let mut buf = preimage.to_vec();
+                        // Ensure the buffer is at least 124 bytes
+                        buf.resize(merkle::AccountProperties::ENCODED_SIZE, 0);
+                        // Update nonce: bytes 8..16 (big-endian u64)
+                        buf[8..16].copy_from_slice(&diff.nonce_after.to_be_bytes());
+                        // Update balance: bytes 16..48 (big-endian U256)
+                        buf[16..48].copy_from_slice(&diff.balance_after.to_be_bytes::<32>());
+                        buf
+                    } else {
+                        // New account — build from scratch
+                        let mut buf = vec![0u8; merkle::AccountProperties::ENCODED_SIZE];
+                        buf[8..16].copy_from_slice(&diff.nonce_after.to_be_bytes());
+                        buf[16..48].copy_from_slice(&diff.balance_after.to_be_bytes::<32>());
+                        buf
+                    };
+
+                    let new_hash = merkle::AccountProperties::hash(&new_encoded);
+                    expected_account_writes.insert(flat_key, new_hash);
+                }
+            }
+
+            // Now verify: every tree_update entry must be either
+            // (a) in REVM's storage_diffs, or (b) in expected_account_writes
             for tree_key in tree_write_map.keys() {
-                assert!(
-                    revm_write_map.contains_key(tree_key),
-                    "tree_update includes {tree_key} that REVM did not write to"
-                );
+                if revm_write_map.contains_key(tree_key) {
+                    continue; // verified by forward check
+                }
+                if let Some(expected_val) = expected_account_writes.get(tree_key) {
+                    let tree_val = &tree_write_map[tree_key];
+                    assert_eq!(
+                        tree_val, expected_val,
+                        "0x8003 account write mismatch for {tree_key}: \
+                         tree={tree_val}, expected={expected_val}"
+                    );
+                } else {
+                    panic!(
+                        "tree_update includes {tree_key} that is neither in REVM writes \
+                         nor in expected 0x8003 account-property writes"
+                    );
+                }
             }
         }
 
