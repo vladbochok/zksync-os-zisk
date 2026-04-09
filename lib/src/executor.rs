@@ -231,14 +231,9 @@ pub fn execute_and_commit(input: &BatchInput) -> (BatchOutput, B256) {
         }
 
         // Reverse check: tree_update writes must also be in REVM writes.
-        // Exceptions:
-        //   - System/upgrade/priority transactions produce additional writes
-        //     via bootloader and system contracts that REVM doesn't see.
-        //   - Merged multi-block tree_updates (indicated by expected_root_after)
-        //     may include entries from blocks with system txs even if the
-        //     current batch's tx types don't include them.
-        let is_merged = tree_update.expected_root_after.is_some();
-        if !has_system_txs && !is_merged {
+        // Exception: system/upgrade/priority transactions produce additional writes
+        // via bootloader and system contracts that REVM doesn't see.
+        if !has_system_txs {
             for tree_key in tree_write_map.keys() {
                 assert!(
                     revm_write_map.contains_key(tree_key),
