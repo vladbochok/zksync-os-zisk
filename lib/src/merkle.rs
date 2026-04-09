@@ -266,21 +266,15 @@ impl BatchTreeUpdate {
         }
 
         leaves.sort_by_key(|(idx, _)| *idx);
-        // Compute the new root independently from intermediate_hashes_new.
-        // SOUND: we never trust expected_root_after — always recompute.
-        let new_root = if !self.intermediate_hashes_new.is_empty() {
-            let computed = self.zip_leaves_with(&leaves, next_tree_index, &self.intermediate_hashes_new);
-            // If expected_root_after is set, cross-check as a sanity assertion
-            if let Some(expected) = self.expected_root_after {
-                assert_eq!(
-                    computed, expected,
-                    "computed new root {computed} != expected {expected}"
-                );
-            }
-            computed
-        } else {
-            self.zip_leaves(&leaves, next_tree_index)
-        };
+        // SOUND: Compute the new root using the OLD intermediate_hashes.
+        // After applying writes (updates + inserts), the leaf values change but
+        // sibling hashes of unchanged subtrees remain the same. For inserts at
+        // new positions, siblings are empty subtree hashes (deterministic).
+        //
+        // We DO NOT use intermediate_hashes_new from the server — that would
+        // be a trust assumption. The old intermediate_hashes were verified via
+        // the old root check above.
+        let new_root = self.zip_leaves(&leaves, next_tree_index);
         (new_root, next_tree_index)
     }
 
