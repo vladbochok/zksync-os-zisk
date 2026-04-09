@@ -100,10 +100,7 @@ fn main() -> anyhow::Result<()> {
             for (bi, block) in batch_input.blocks.iter().enumerate() {
                 eprintln!("\n--- Block {} (number={}) ---", bi, block.number);
                 eprintln!("  base_fee={}, gas_limit={}, timestamp={}, coinbase={}", block.base_fee, block.gas_limit, block.timestamp, block.coinbase);
-                eprintln!("  accounts: {}", block.accounts.len());
-                for (addr, data) in &block.accounts {
-                    eprintln!("    {addr}: nonce={}, balance={}, code_hash={}", data.nonce, data.balance, data.code_hash);
-                }
+                eprintln!("  account_preimages: {}", block.account_preimages.len());
                 eprintln!("  storage slots: {}", block.storage.len());
                 for (addr, slot, val) in &block.storage {
                     if format!("{addr}").contains("800f") {
@@ -285,11 +282,6 @@ fn make_sample_batch() -> BatchInput {
                 gas_used_override: Some(21_000), force_fail: false,
                 mint: None, refund_recipient: None, is_l1_tx: false, l1_tx_hash: None, signed_tx_bytes: None,
             }],
-            accounts: vec![
-                (sender, AccountData { nonce: 0, balance: U256::from(10_000_000_000_000_000_000u128), code_hash: B256::ZERO }),
-                (recipient, AccountData { nonce: 0, balance: U256::ZERO, code_hash: B256::ZERO }),
-                (coinbase, AccountData { nonce: 0, balance: U256::ZERO, code_hash: B256::ZERO }),
-            ],
             account_preimages: vec![],
             storage: vec![], block_hashes: vec![],
             l2_to_l1_logs: vec![],

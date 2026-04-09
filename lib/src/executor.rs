@@ -30,10 +30,10 @@ use crate::types::*;
 struct ProvenDB {
     /// Pre-verified storage values: flat_key -> value (None = proven non-existing).
     /// All proofs are verified at construction time; reads are pure lookups.
+    /// This includes account-property entries at address 0x8003.
     verified_storage: HashMap<B256, Option<B256>>,
-    /// Account data verified via merkle proofs.
-    /// Some(info) = account exists with given properties.
-    /// None = account proven non-existent in the tree.
+    /// Merkle-verified account info. Every entry was proven against the tree
+    /// root at construction time. None = proven non-existent.
     verified_accounts: HashMap<Address, Option<AccountInfo>>,
     /// Verified bytecodes keyed by hash (keccak256 or blake2s).
     bytecodes: HashMap<B256, Bytecode>,
@@ -58,9 +58,7 @@ impl DatabaseRef for ProvenDB {
 
     fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
         match self.verified_accounts.get(&address) {
-            // Account was proven (exists or non-existent)
             Some(proven) => Ok(proven.clone()),
-            // No proof provided at all — server error
             None => Err(ProvenDBError(format!(
                 "no proof for account {address}. The server must provide a merkle proof \
                  (existence or non-existence) for every account REVM accesses."
@@ -240,7 +238,7 @@ pub fn execute_and_commit(input: &BatchInput) -> (BatchOutput, B256) {
                 }
             }
             let total_accounts: usize = input.blocks.iter()
-                .map(|b| b.account_preimages.len() + b.accounts.len())
+                .map(|b| b.account_preimages.len())
                 .sum();
             assert!(
                 extra_count <= total_accounts,
@@ -584,63 +582,33 @@ fn build_proven_db(input: &BatchInput) -> ProvenDB {
             verified_storage.entry(*key).or_insert(value);
         }
 
-        // Build verified accounts from merkle proofs of address 0x8003.
-        // Every accessed account must have a merkle proof (existence or
-        // non-existence). Existing accounts also require a preimage.
-        let preimage_map: HashMap<&Address, &Vec<u8>> = block.account_preimages
-            .iter().map(|(a, p)| (a, p)).collect();
-
-        // Collect all addresses the server says will be accessed.
-        let all_addrs: Vec<Address> = block.accounts.iter().map(|(a, _)| *a)
-            .chain(block.account_preimages.iter().map(|(a, _)| *a))
-            .collect();
-
-        for addr in &all_addrs {
+        // Build verified accounts from account_preimages.
+        // Each preimage is verified against the merkle proof in verified_storage.
+        for (addr, preimage) in &block.account_preimages {
             if verified_accounts.contains_key(addr) { continue; }
             let addr_bytes: [u8; 20] = addr.into_array();
             let flat_key = merkle::derive_account_properties_key(&addr_bytes);
 
-            // Look up the merkle proof for this account.
-            let proof = match block.storage_proofs.iter().find(|(k, _)| *k == flat_key) {
-                Some((_, p)) => p,
-                None => panic!(
-                    "no merkle proof for account {addr} (flat_key={flat_key}). \
-                     The server must provide a storage_proof for every accessed account."
-                ),
-            };
-
-            let (root, proven_value) = proof
-                .verify(&flat_key)
-                .unwrap_or_else(|e| panic!("account proof failed for {addr}: {e}"));
-
-            assert_eq!(
-                root, *expected_root,
-                "account proof for {addr} recovers wrong root"
-            );
+            let proven_value = verified_storage.get(&flat_key).unwrap_or_else(|| {
+                panic!(
+                    "account_preimage for {addr} but no storage proof at flat_key={flat_key}"
+                )
+            });
 
             match proven_value {
                 None => {
-                    // Account proven NON-EXISTENT in the tree.
                     verified_accounts.insert(*addr, None);
                 }
                 Some(proven_hash) => {
-                    // Account EXISTS — must have a preimage to decode properties.
-                    let preimage_bytes = preimage_map.get(addr).unwrap_or_else(|| {
-                        panic!(
-                            "account {addr} exists in merkle tree (hash={proven_hash}) \
-                             but no preimage provided in account_preimages"
-                        )
-                    });
-
-                    let preimage_hash = merkle::AccountProperties::hash(preimage_bytes);
+                    let preimage_hash = merkle::AccountProperties::hash(preimage);
                     assert_eq!(
-                        proven_hash, preimage_hash,
+                        *proven_hash, preimage_hash,
                         "account preimage hash mismatch for {addr}: \
-                         proven value {proven_hash}, preimage hash {preimage_hash}"
+                         proven={proven_hash}, computed={preimage_hash}"
                     );
 
-                    let props = merkle::AccountProperties::decode(preimage_bytes);
-                    let observable_code_hash = if props.observable_bytecode_hash.is_zero() {
+                    let props = merkle::AccountProperties::decode(preimage);
+                    let code_hash = if props.observable_bytecode_hash.is_zero() {
                         if props.nonce == 0 && props.balance == [0u8; 32] {
                             B256::ZERO
                         } else {
@@ -649,19 +617,15 @@ fn build_proven_db(input: &BatchInput) -> ProvenDB {
                     } else {
                         props.observable_bytecode_hash
                     };
+                    let code = bytecodes.get(&code_hash).cloned();
 
-                    let code = bytecodes.get(&observable_code_hash).cloned();
-
-                    verified_accounts.insert(
-                        *addr,
-                        Some(AccountInfo {
-                            nonce: props.nonce,
-                            balance: U256::from_be_bytes(props.balance),
-                            code_hash: observable_code_hash,
-                            code,
-                            account_id: None,
-                        }),
-                    );
+                    verified_accounts.insert(*addr, Some(AccountInfo {
+                        nonce: props.nonce,
+                        balance: U256::from_be_bytes(props.balance),
+                        code_hash,
+                        code,
+                        account_id: None,
+                    }));
                 }
             }
         }
@@ -879,13 +843,21 @@ fn build_simple_db_batch(input: &BatchInput) -> SimpleDB {
     }
 
     for block in &input.blocks {
-        for (addr, data) in &block.accounts {
-            accounts.entry(*addr).or_insert_with(|| AccountInfo {
-                nonce: data.nonce,
-                balance: data.balance,
-                code_hash: if data.code_hash.is_zero() { KECCAK_EMPTY } else { data.code_hash },
-                code: None,
-                account_id: None,
+        for (addr, preimage) in &block.account_preimages {
+            accounts.entry(*addr).or_insert_with(|| {
+                let props = merkle::AccountProperties::decode(preimage);
+                let code_hash = if props.observable_bytecode_hash.is_zero() {
+                    KECCAK_EMPTY
+                } else {
+                    props.observable_bytecode_hash
+                };
+                AccountInfo {
+                    nonce: props.nonce,
+                    balance: U256::from_be_bytes(props.balance),
+                    code_hash,
+                    code: None,
+                    account_id: None,
+                }
             });
         }
         for &(addr, slot, value) in &block.storage {
@@ -994,21 +966,14 @@ fn collect_batch_diffs(
     input: &BatchInput,
 ) -> (Vec<StorageDiff>, Vec<AccountDiff>) {
     // Build batch-level lookup maps for "before" values from all blocks' pre-state.
-    let mut preimage_map: HashMap<Address, &[u8]> = HashMap::new();
-    let mut account_map: HashMap<Address, &AccountData> = HashMap::new();
     let mut storage_map: HashMap<(Address, U256), U256> = HashMap::new();
     for block in &input.blocks {
-        for (a, p) in &block.account_preimages {
-            preimage_map.entry(*a).or_insert(p.as_slice());
-        }
-        for (a, d) in &block.accounts {
-            account_map.entry(*a).or_insert(d);
-        }
         for &(a, s, v) in &block.storage {
             storage_map.entry((a, s)).or_insert(v);
         }
     }
 
+    let proven_db = &cache_db.db;
     let mut storage_diffs = Vec::new();
     let mut account_diffs = Vec::new();
     for (addr, db_account) in cache_db.cache.accounts.iter() {
@@ -1019,15 +984,12 @@ fn collect_batch_diffs(
             continue;
         }
         let info = &db_account.info;
-        let (nonce_before, balance_before) = preimage_map
+        // Before-values from merkle-verified accounts.
+        // Non-existent accounts have before = (0, 0).
+        let (nonce_before, balance_before) = proven_db.verified_accounts
             .get(addr)
-            .map(|preimage| {
-                let props = merkle::AccountProperties::decode(preimage);
-                (props.nonce, U256::from_be_bytes(props.balance))
-            })
-            .or_else(|| {
-                account_map.get(addr).map(|d| (d.nonce, d.balance))
-            })
+            .and_then(|opt| opt.as_ref())
+            .map(|ai| (ai.nonce, ai.balance))
             .unwrap_or((0, U256::ZERO));
 
         if info.nonce != nonce_before || info.balance != balance_before {

@@ -70,12 +70,9 @@ pub struct BlockInput {
     pub coinbase: Address,
     pub prev_randao: B256,
     pub transactions: Vec<TxInput>,
-    /// Pre-state accounts — used by unverified (testing) path only.
-    /// In proven mode, accounts are decoded from merkle proofs of 0x8003.
-    pub accounts: Vec<(Address, AccountData)>,
     /// Account property preimages (124-byte encoded AccountProperties).
-    /// Keyed by address. Used in proven mode to decode nonce/balance/code
-    /// from the merkle-verified value at (0x8003, left_padded_address).
+    /// Keyed by address. Used to decode nonce/balance/code_hash from the
+    /// merkle-verified value at (0x8003, left_padded_address).
     pub account_preimages: Vec<(Address, Vec<u8>)>,
     /// Pre-state storage slots.
     pub storage: Vec<(Address, U256, U256)>,
@@ -96,14 +93,6 @@ pub struct BlockInput {
     /// Defaults to B256::ZERO for backward compat (executor falls back to batch root).
     #[serde(default)]
     pub expected_tree_root: B256,
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-pub struct AccountData {
-
-    pub nonce: u64,
-    pub balance: U256,
-    pub code_hash: B256,
 }
 
 #[derive(Serialize, Deserialize, Clone)]

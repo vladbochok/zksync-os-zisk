@@ -154,12 +154,6 @@ mod tests {
                 storage_proofs: vec![(sender_flat_key, proof)],
                 // Account preimage for decoding
                 account_preimages: vec![(sender, sender_props)],
-                // Keep accounts for the unverified fields (recipient, coinbase)
-                // In full proven mode these would also need proofs
-                accounts: vec![
-                    (recipient, AccountData { nonce: 0, balance: U256::ZERO, code_hash: B256::ZERO }),
-                    (Address::ZERO, AccountData { nonce: 0, balance: U256::ZERO, code_hash: B256::ZERO }),
-                ],
                 transactions: vec![TxInput {
                     caller: sender,
                     gas_limit: 21_000,
@@ -259,10 +253,6 @@ mod tests {
                 block_header_hash: B256::ZERO,
                 storage_proofs: vec![(sender_flat_key, proof)],
                 account_preimages: vec![(sender, sender_props)],
-                accounts: vec![
-                    (recipient, AccountData { nonce: 0, balance: U256::ZERO, code_hash: B256::ZERO }),
-                    (Address::ZERO, AccountData { nonce: 0, balance: U256::ZERO, code_hash: B256::ZERO }),
-                ],
                 transactions: vec![TxInput {
                     caller: sender,
                     gas_limit: 21_000,
