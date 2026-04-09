@@ -472,16 +472,18 @@ fn execute_block_proven(
     // For L2 txs, the hash comes from signed_tx_bytes (keccak256(signed_bytes)).
     // For L1 txs, it comes from l1_tx_hash.
     let tx_hashes: Vec<B256> = block.transactions.iter().map(|tx| {
-        let hash = if let Some(ref signed) = tx.signed_tx_bytes {
-            alloy_primitives::keccak256(signed)
-        } else if let Some(hash) = tx.l1_tx_hash {
+        if let Some(hash) = tx.l1_tx_hash {
+            // L1 priority txs use their canonical priority queue hash.
             hash
         } else if tx.tx_type == 0x7e {
+            // Upgrade txs use the batch-level upgrade tx hash.
             batch_meta.upgrade_tx_hash
+        } else if let Some(ref signed) = tx.signed_tx_bytes {
+            // L2 txs use keccak256 of the signed EIP-2718 encoded bytes.
+            alloy_primitives::keccak256(signed)
         } else {
             B256::ZERO
-        };
-        hash
+        }
     }).collect();
     let tx_root = commitment::transactions_rolling_hash(&tx_hashes);
 
