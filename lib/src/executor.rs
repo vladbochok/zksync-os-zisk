@@ -31,9 +31,11 @@ struct ProvenDB {
     /// Pre-verified storage values: flat_key -> value (None = proven non-existing).
     /// All proofs are verified at construction time; reads are pure lookups.
     verified_storage: HashMap<B256, Option<B256>>,
-    /// Account data decoded from merkle-verified preimages.
-    verified_accounts: HashMap<Address, AccountInfo>,
-    /// Verified bytecodes: hash checked against code at load time.
+    /// Account data verified via merkle proofs.
+    /// Some(info) = account exists with given properties.
+    /// None = account proven non-existent in the tree.
+    verified_accounts: HashMap<Address, Option<AccountInfo>>,
+    /// Verified bytecodes keyed by hash (keccak256 or blake2s).
     bytecodes: HashMap<B256, Bytecode>,
     /// Block hashes for BLOCKHASH opcode (verified against batch_meta).
     block_hashes: HashMap<u64, B256>,
@@ -55,7 +57,15 @@ impl DatabaseRef for ProvenDB {
     type Error = ProvenDBError;
 
     fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
-        Ok(self.verified_accounts.get(&address).cloned())
+        match self.verified_accounts.get(&address) {
+            // Account was proven (exists or non-existent)
+            Some(proven) => Ok(proven.clone()),
+            // No proof provided at all — server error
+            None => Err(ProvenDBError(format!(
+                "no proof for account {address}. The server must provide a merkle proof \
+                 (existence or non-existence) for every account REVM accesses."
+            ))),
+        }
     }
 
     fn code_by_hash_ref(&self, code_hash: B256) -> Result<Bytecode, Self::Error> {
@@ -539,7 +549,7 @@ fn execute_block_proven(
 fn build_proven_db(input: &BatchInput) -> ProvenDB {
     let meta = &input.batch_meta;
     let mut verified_storage: HashMap<B256, Option<B256>> = HashMap::new();
-    let mut verified_accounts: HashMap<Address, AccountInfo> = HashMap::new();
+    let mut verified_accounts: HashMap<Address, Option<AccountInfo>> = HashMap::new();
     let mut bytecodes: HashMap<B256, Bytecode> = HashMap::new();
     let mut block_hashes: HashMap<u64, B256> = HashMap::new();
 
@@ -575,22 +585,29 @@ fn build_proven_db(input: &BatchInput) -> ProvenDB {
         }
 
         // Build verified accounts from merkle proofs of address 0x8003.
-        for (addr, preimage_bytes) in &block.account_preimages {
+        // Every accessed account must have a merkle proof (existence or
+        // non-existence). Existing accounts also require a preimage.
+        let preimage_map: HashMap<&Address, &Vec<u8>> = block.account_preimages
+            .iter().map(|(a, p)| (a, p)).collect();
+
+        // Collect all addresses the server says will be accessed.
+        let all_addrs: Vec<Address> = block.accounts.iter().map(|(a, _)| *a)
+            .chain(block.account_preimages.iter().map(|(a, _)| *a))
+            .collect();
+
+        for addr in &all_addrs {
             if verified_accounts.contains_key(addr) { continue; }
             let addr_bytes: [u8; 20] = addr.into_array();
             let flat_key = merkle::derive_account_properties_key(&addr_bytes);
 
-            let preimage_hash = merkle::AccountProperties::hash(preimage_bytes);
-
-            let proof = block.storage_proofs.iter()
-                .find(|(k, _)| *k == flat_key)
-                .map(|(_, p)| p)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "no merkle proof for account {addr} (flat_key={flat_key}). \
-                         Every account_preimage must have a corresponding storage_proof."
-                    )
-                });
+            // Look up the merkle proof for this account.
+            let proof = match block.storage_proofs.iter().find(|(k, _)| *k == flat_key) {
+                Some((_, p)) => p,
+                None => panic!(
+                    "no merkle proof for account {addr} (flat_key={flat_key}). \
+                     The server must provide a storage_proof for every accessed account."
+                ),
+            };
 
             let (root, proven_value) = proof
                 .verify(&flat_key)
@@ -601,40 +618,52 @@ fn build_proven_db(input: &BatchInput) -> ProvenDB {
                 "account proof for {addr} recovers wrong root"
             );
 
-            let proven_val = match proven_value {
-                Some(v) => v,
-                None => continue,
-            };
-
-            assert_eq!(
-                proven_val, preimage_hash,
-                "account preimage hash mismatch for {addr}: \
-                 proven value {proven_val}, preimage hash {preimage_hash}"
-            );
-
-            let props = merkle::AccountProperties::decode(preimage_bytes);
-            let observable_code_hash = if props.observable_bytecode_hash.is_zero() {
-                if props.nonce == 0 && props.balance == [0u8; 32] {
-                    B256::ZERO
-                } else {
-                    KECCAK_EMPTY
+            match proven_value {
+                None => {
+                    // Account proven NON-EXISTENT in the tree.
+                    verified_accounts.insert(*addr, None);
                 }
-            } else {
-                props.observable_bytecode_hash
-            };
+                Some(proven_hash) => {
+                    // Account EXISTS — must have a preimage to decode properties.
+                    let preimage_bytes = preimage_map.get(addr).unwrap_or_else(|| {
+                        panic!(
+                            "account {addr} exists in merkle tree (hash={proven_hash}) \
+                             but no preimage provided in account_preimages"
+                        )
+                    });
 
-            let code = bytecodes.get(&props.observable_bytecode_hash).cloned();
+                    let preimage_hash = merkle::AccountProperties::hash(preimage_bytes);
+                    assert_eq!(
+                        proven_hash, preimage_hash,
+                        "account preimage hash mismatch for {addr}: \
+                         proven value {proven_hash}, preimage hash {preimage_hash}"
+                    );
 
-            verified_accounts.insert(
-                *addr,
-                AccountInfo {
-                    nonce: props.nonce,
-                    balance: U256::from_be_bytes(props.balance),
-                    code_hash: observable_code_hash,
-                    code,
-                    account_id: None,
-                },
-            );
+                    let props = merkle::AccountProperties::decode(preimage_bytes);
+                    let observable_code_hash = if props.observable_bytecode_hash.is_zero() {
+                        if props.nonce == 0 && props.balance == [0u8; 32] {
+                            B256::ZERO
+                        } else {
+                            KECCAK_EMPTY
+                        }
+                    } else {
+                        props.observable_bytecode_hash
+                    };
+
+                    let code = bytecodes.get(&observable_code_hash).cloned();
+
+                    verified_accounts.insert(
+                        *addr,
+                        Some(AccountInfo {
+                            nonce: props.nonce,
+                            balance: U256::from_be_bytes(props.balance),
+                            code_hash: observable_code_hash,
+                            code,
+                            account_id: None,
+                        }),
+                    );
+                }
+            }
         }
 
         // Verify block hashes against batch_meta.previous_block_hashes.
@@ -658,24 +687,6 @@ fn build_proven_db(input: &BatchInput) -> ProvenDB {
             block_hashes.insert(num, hash);
         }
 
-        // For accounts not in account_preimages, use block.accounts data.
-        for (addr, data) in &block.accounts {
-            if verified_accounts.contains_key(addr) { continue; }
-            let code_hash = if data.code_hash.is_zero() {
-                if data.nonce == 0 && data.balance.is_zero() { continue; }
-                KECCAK_EMPTY
-            } else {
-                data.code_hash
-            };
-            let code = bytecodes.get(&code_hash).cloned();
-            verified_accounts.insert(*addr, AccountInfo {
-                nonce: data.nonce,
-                balance: data.balance,
-                code_hash,
-                code,
-                account_id: None,
-            });
-        }
     }
 
     ProvenDB {
