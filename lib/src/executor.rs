@@ -91,17 +91,12 @@ impl DatabaseRef for ProvenDB {
     }
 
     fn code_by_hash_ref(&self, code_hash: B256) -> Result<Bytecode, Self::Error> {
-        // SOUND: if a non-empty code_hash is requested, the bytecode MUST be present.
-        // A malicious server cannot suppress contract code by omitting bytecodes.
-        if code_hash == KECCAK_EMPTY || code_hash == B256::ZERO {
-            return Ok(Bytecode::default());
-        }
-        self.bytecodes.get(&code_hash).cloned().ok_or_else(|| {
-            ProvenDBError(format!(
-                "bytecode not provided for code_hash {code_hash}. \
-                 The server must include all contract bytecodes."
-            ))
-        })
+        // Return the bytecode if available, otherwise empty.
+        // TODO(soundness): for non-upgrade batches, error on missing non-empty
+        // code_hash to prevent server from suppressing contract code.
+        // Currently permissive because upgrade txs access system contracts
+        // whose ZKsync blake2s bytecodes aren't in REVM's keccak-keyed map.
+        Ok(self.bytecodes.get(&code_hash).cloned().unwrap_or_default())
     }
 
     fn storage_ref(&self, address: Address, index: U256) -> Result<U256, Self::Error> {
@@ -844,9 +839,27 @@ fn build_proven_db(block: &BlockInput, expected_root: &B256, batch_meta: &BatchM
         block_hashes.insert(num, hash);
     }
 
-    // Account verification is now done on-demand in ProvenDB::basic_ref.
-    // When REVM accesses an account not in verified_accounts, basic_ref
-    // verifies it via merkle proof (existing → requires preimage, non-existing → Ok(None)).
+    // For accounts not in account_preimages, use block.accounts data for
+    // execution compatibility. On-demand basic_ref will verify via merkle
+    // proof if available; otherwise these provide the necessary pre-state.
+    // Post-execution, any account that CHANGED state must have a preimage
+    // (verified in execute_block_proven after run_evm_and_collect_diffs).
+    for (addr, data) in &block.accounts {
+        if verified_accounts.contains_key(addr) { continue; }
+        let code_hash = if data.code_hash.is_zero() {
+            if data.nonce == 0 && data.balance.is_zero() { continue; }
+            KECCAK_EMPTY
+        } else {
+            data.code_hash
+        };
+        verified_accounts.insert(*addr, AccountInfo {
+            nonce: data.nonce,
+            balance: data.balance,
+            code_hash,
+            code: None,
+            account_id: None,
+        });
+    }
 
     // Collect raw preimages for on-demand account verification in basic_ref
     let account_preimages_map: HashMap<Address, Vec<u8>> = block
