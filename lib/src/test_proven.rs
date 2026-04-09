@@ -473,46 +473,15 @@ mod tests {
             // Now run REVM and compare writes
             let output = executor::execute_batch(&batch);
             for (i, br) in output.block_results.iter().enumerate() {
-                println!("  REVM block {}: {} tx_results, {} storage_diffs, {} account_diffs",
-                    br.block_number, br.tx_results.len(), br.storage_diffs.len(), br.account_diffs.len());
+                println!("  REVM block {}: {} tx_results",
+                    br.block_number, br.tx_results.len());
                 for (j, tx) in br.tx_results.iter().enumerate() {
                     let output_hex: String = tx.output.iter().map(|b| format!("{:02x}", b)).collect();
                     println!("    tx[{j}]: success={}, gas={}, output=0x{}", tx.success, tx.gas_used, output_hex);
                 }
             }
-            let revm_writes: HMap<B256, B256> = output.block_results.iter()
-                .flat_map(|br| br.storage_diffs.iter().map(|d| {
-                    let addr: [u8; 20] = d.address.into_array();
-                    let slot = B256::from(d.slot.to_be_bytes::<32>());
-                    let fk = crate::merkle::derive_flat_storage_key(&addr, &slot);
-                    let val = B256::from(d.new_value.to_be_bytes::<32>());
-                    (fk, val)
-                }))
-                .collect();
             let tree_writes: HMap<B256, B256> = tu.entries.iter().cloned().collect();
-
-            println!("\n  REVM writes: {}", revm_writes.len());
-            println!("  tree_update writes: {}", tree_writes.len());
-
-            let mut only_in_tree = Vec::new();
-            for tk in tree_writes.keys() {
-                if !revm_writes.contains_key(tk) {
-                    only_in_tree.push(tk);
-                }
-            }
-            only_in_tree.sort();
-            println!("  Only in tree_update (NOT in REVM): {}", only_in_tree.len());
-            for (i, k) in only_in_tree.iter().enumerate().take(10) {
-                println!("    [{i}] flat_key={k}");
-            }
-
-            let mut only_in_revm = Vec::new();
-            for rk in revm_writes.keys() {
-                if !tree_writes.contains_key(rk) {
-                    only_in_revm.push(rk);
-                }
-            }
-            println!("  Only in REVM (NOT in tree_update): {}", only_in_revm.len());
+            println!("\n  tree_update writes: {}", tree_writes.len());
         } else {
             println!("No tree_update!");
         }
@@ -588,11 +557,9 @@ mod tests {
         );
         for br in &output.block_results {
             println!(
-                "  Block {}: {} txs, {} account_diffs, {} storage_diffs",
+                "  Block {}: {} txs",
                 br.block_number,
                 br.tx_results.len(),
-                br.account_diffs.len(),
-                br.storage_diffs.len(),
             );
         }
     }

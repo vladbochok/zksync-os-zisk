@@ -184,8 +184,6 @@ pub struct BlockResult {
     ///   nonce=0, base_fee_per_gas))
     pub computed_block_header_hash: B256,
     pub tx_results: Vec<TxOutput>,
-    pub storage_diffs: Vec<StorageDiff>,
-    pub account_diffs: Vec<AccountDiff>,
     pub l2_to_l1_logs: Vec<L2ToL1LogEntry>,
 }
 

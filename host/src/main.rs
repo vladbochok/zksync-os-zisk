@@ -65,7 +65,7 @@ fn main() -> anyhow::Result<()> {
                 for (i, tx) in br.tx_results.iter().enumerate() {
                     eprintln!("  tx[{i}]: success={}, gas={}", tx.success, tx.gas_used);
                 }
-                eprintln!("  account_diffs: {}, storage_diffs: {}", br.account_diffs.len(), br.storage_diffs.len());
+                eprintln!("  l2_to_l1_logs: {}", br.l2_to_l1_logs.len());
             }
             let hash = executor::compute_output_hash(&output);
             eprintln!("\nOutput hash: 0x{}", hex::encode(hash));
@@ -162,8 +162,6 @@ fn main() -> anyhow::Result<()> {
             eprintln!("╠──────────────────────────┼───────────────────────────────────");
             eprintln!("║ tx[0] success             │ {}", br.tx_results[0].success);
             eprintln!("║ tx[0] gas_used            │ {}", br.tx_results[0].gas_used);
-            eprintln!("║ storage_diffs count       │ {}", br.storage_diffs.len());
-            eprintln!("║ account_diffs count       │ {}", br.account_diffs.len());
             eprintln!("║ l2_to_l1_logs count       │ {}", br.l2_to_l1_logs.len());
             eprintln!("║ block_header_hash         │ {}", br.computed_block_header_hash);
             eprintln!("╠──────────────────────────┼───────────────────────────────────");
@@ -173,18 +171,6 @@ fn main() -> anyhow::Result<()> {
                 let encoded = log.encode();
                 let log_hash = alloy_primitives::keccak256(&encoded);
                 eprintln!("║ l2_to_l1_log[{i}] hash     │ {log_hash}");
-            }
-
-            // Storage diffs (first 10)
-            for (i, diff) in br.storage_diffs.iter().enumerate() {
-                eprintln!("║ SD[{i}] addr={} slot={} new={}",
-                    diff.address, diff.slot, diff.new_value);
-            }
-
-            // Account diffs
-            for diff in &br.account_diffs {
-                eprintln!("║ account_diff              │ addr={} nonce_before={} balance_before={} nonce_after={} balance_after={}",
-                    diff.address, diff.nonce_before, diff.balance_before, diff.nonce_after, diff.balance_after);
             }
 
             eprintln!("╚══════════════════════════════════════════════════════════════");

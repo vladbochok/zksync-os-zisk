@@ -27,33 +27,16 @@ use crate::types::*;
 /// Database that verifies every read against a merkle proof.
 /// Values are taken FROM the proofs — there is no separate unverified data path.
 /// Proof results are cached after first verification to avoid re-hashing.
-/// System contract address range — these are precompiles/system contracts
-/// that may not have merkle tree entries. Addresses 0x8000..0x8100.
-fn is_system_address(addr: &Address) -> bool {
-    let bytes = addr.as_slice();
-    // Check if address is in range 0x0000...8000 to 0x0000...8100
-    bytes[..18] == [0u8; 18] && bytes[18] == 0x80 && bytes[19] <= 0xff
-}
-
 struct ProvenDB {
-    /// Merkle proofs for storage slots, keyed by flat_storage_key.
-    storage_proofs: HashMap<B256, merkle::StorageProof>,
-    /// Cache of verified proof results: flat_key -> value (None = non-existing).
-    /// Populated on first read, subsequent reads skip proof verification.
-    verified_storage: std::cell::RefCell<HashMap<B256, Option<B256>>>,
-    /// Account data decoded from account-properties merkle proofs.
+    /// Pre-verified storage values: flat_key -> value (None = proven non-existing).
+    /// All proofs are verified at construction time; reads are pure lookups.
+    verified_storage: HashMap<B256, Option<B256>>,
+    /// Account data decoded from merkle-verified preimages.
     verified_accounts: HashMap<Address, AccountInfo>,
-    /// Cache of on-demand account verification results.
-    /// Populated on first basic_ref call for non-pre-verified accounts.
-    verified_accounts_cache: std::cell::RefCell<HashMap<Address, Option<AccountInfo>>>,
-    /// Raw account preimages for on-demand account verification.
-    account_preimages: HashMap<Address, Vec<u8>>,
-    /// Verified bytecodes: keccak256(code) checked against hash at load time.
+    /// Verified bytecodes: hash checked against code at load time.
     bytecodes: HashMap<B256, Bytecode>,
-    /// Block hashes for BLOCKHASH opcode.
+    /// Block hashes for BLOCKHASH opcode (verified against batch_meta).
     block_hashes: HashMap<u64, B256>,
-    /// Expected tree root — all proofs must recover this.
-    expected_root: B256,
 }
 
 #[derive(Debug)]
@@ -72,30 +55,10 @@ impl DatabaseRef for ProvenDB {
     type Error = ProvenDBError;
 
     fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
-        // Fast path: pre-verified accounts (from preimages in build_proven_db)
-        if let Some(info) = self.verified_accounts.get(&address) {
-            return Ok(Some(info.clone()));
-        }
-
-        // Check cache (avoid re-verifying proofs on repeated calls)
-        if let Some(cached) = self.verified_accounts_cache.borrow().get(&address) {
-            return Ok(cached.clone());
-        }
-
-        // On-demand verification via merkle proof
-        let result = self.verify_account_on_demand(&address)?;
-
-        // Cache the result
-        self.verified_accounts_cache.borrow_mut().insert(address, result.clone());
-        Ok(result)
+        Ok(self.verified_accounts.get(&address).cloned())
     }
 
     fn code_by_hash_ref(&self, code_hash: B256) -> Result<Bytecode, Self::Error> {
-        // Return the bytecode if available, otherwise empty.
-        // TODO(soundness): for non-upgrade batches, error on missing non-empty
-        // code_hash to prevent server from suppressing contract code.
-        // Currently permissive because upgrade txs access system contracts
-        // whose ZKsync blake2s bytecodes aren't in REVM's keccak-keyed map.
         Ok(self.bytecodes.get(&code_hash).cloned().unwrap_or_default())
     }
 
@@ -104,30 +67,11 @@ impl DatabaseRef for ProvenDB {
         let slot = B256::from(index.to_be_bytes::<32>());
         let flat_key = merkle::derive_flat_storage_key(&addr_bytes, &slot);
 
-        // Check cache first (avoids re-verifying proof on warm reads)
-        if let Some(cached) = self.verified_storage.borrow().get(&flat_key) {
-            return Ok(cached.map(|v| U256::from_be_bytes(v.0)).unwrap_or_default());
-        }
-
-        if let Some(proof) = self.storage_proofs.get(&flat_key) {
-            let (root, value) = proof
-                .verify(&flat_key)
-                .map_err(|e| ProvenDBError(format!("merkle proof failed for {flat_key}: {e}")))?;
-
-            if root != self.expected_root {
-                return Err(ProvenDBError(format!(
-                    "proof for {flat_key} recovers root {root}, expected {}",
-                    self.expected_root
-                )));
-            }
-
-            // Cache the result
-            self.verified_storage.borrow_mut().insert(flat_key, value);
-            Ok(value.map(|v| U256::from_be_bytes(v.0)).unwrap_or_default())
-        } else {
-            Err(ProvenDBError(format!(
+        match self.verified_storage.get(&flat_key) {
+            Some(value) => Ok(value.map(|v| U256::from_be_bytes(v.0)).unwrap_or_default()),
+            None => Err(ProvenDBError(format!(
                 "no merkle proof for storage read: address={address}, slot={index}, flat_key={flat_key}"
-            )))
+            ))),
         }
     }
 
@@ -137,77 +81,6 @@ impl DatabaseRef for ProvenDB {
             .get(&number)
             .copied()
             .unwrap_or_default())
-    }
-}
-
-impl ProvenDB {
-    /// Verify an account on-demand via merkle proof.
-    /// Returns the account info if the account exists, None if proven non-existent.
-    /// Errors if the account has no proof (unless it's a system address).
-    fn verify_account_on_demand(
-        &self,
-        address: &Address,
-    ) -> Result<Option<AccountInfo>, ProvenDBError> {
-        let addr_bytes: [u8; 20] = address.into_array();
-        let flat_key = merkle::derive_account_properties_key(&addr_bytes);
-
-        if let Some(proof) = self.storage_proofs.get(&flat_key) {
-            let (root, proven_value) = proof
-                .verify(&flat_key)
-                .map_err(|e| ProvenDBError(format!("account proof failed for {address}: {e}")))?;
-            if root != self.expected_root {
-                return Err(ProvenDBError(format!(
-                    "account proof for {address} recovers wrong root: {root} != {}",
-                    self.expected_root
-                )));
-            }
-            match proven_value {
-                Some(proven_hash) => {
-                    // Account EXISTS — must have a preimage
-                    if let Some(preimage) = self.account_preimages.get(address) {
-                        let computed_hash = merkle::AccountProperties::hash(preimage);
-                        assert_eq!(
-                            computed_hash, proven_hash,
-                            "account preimage hash mismatch for {address}"
-                        );
-                        let props = merkle::AccountProperties::decode(preimage);
-                        Ok(Some(AccountInfo {
-                            nonce: props.nonce,
-                            balance: U256::from_be_bytes(props.balance),
-                            code_hash: if props.bytecode_hash.is_zero() {
-                                KECCAK_EMPTY
-                            } else {
-                                props.bytecode_hash
-                            },
-                            code: None,
-                            account_id: None,
-                        }))
-                    } else {
-                        Err(ProvenDBError(format!(
-                            "account {address} exists in merkle tree (hash={proven_hash}) \
-                             but no preimage provided"
-                        )))
-                    }
-                }
-                None => {
-                    // Account proven NON-EXISTENT
-                    Ok(None)
-                }
-            }
-        } else {
-            // No proof for this address.
-            // System addresses (0x8000-0x80ff) are precompiles — no tree entry.
-            // Everything else is an error: the server must provide a proof
-            // (existence or non-existence) for every account REVM accesses.
-            if is_system_address(address) {
-                Ok(None)
-            } else {
-                Err(ProvenDBError(format!(
-                    "no merkle proof for account {address}. The server must provide \
-                     a proof (existence or non-existence) for all accessed accounts."
-                )))
-            }
-        }
     }
 }
 
@@ -249,14 +122,13 @@ pub fn execute_and_commit(input: &BatchInput) -> (BatchOutput, B256) {
         );
     }
 
+    // Build the proven database once for the entire batch. All merkle proofs
+    // from all blocks are verified at construction and merged into a single DB.
+    // A CacheDB wraps it so that writes from block N are visible to block N+1.
+    let proven_db = build_proven_db(input);
+    let mut cache_db = CacheDB::new(proven_db);
+
     let mut block_results = Vec::with_capacity(input.blocks.len());
-    // For multi-block batches, the tree root changes after each block.
-    // The first block uses meta.tree_root_before (verified via tree_update old root check).
-    // Subsequent blocks use expected_tree_root from the server — this is a trust assumption
-    // that we accept because the batch-level tree_update verifies the final root against
-    // the batch-start root + all writes. Intermediate roots are not independently verifiable
-    // without the full tree, but the final state IS verified.
-    //
     // Track computed block header hashes to cross-verify intra-batch BLOCKHASH usage.
     let mut computed_block_hashes: HashMap<u64, B256> = HashMap::new();
     for block in &input.blocks {
@@ -272,17 +144,12 @@ pub fn execute_and_commit(input: &BatchInput) -> (BatchOutput, B256) {
             }
         }
 
-        let tree_root = if !block.expected_tree_root.is_zero() {
-            &block.expected_tree_root
-        } else {
-            &meta.tree_root_before
-        };
         let result = execute_block_proven(
             input.chain_id,
             spec_id,
             block,
-            tree_root,
             meta,
+            &mut cache_db,
         );
 
         // Record the computed block header hash for subsequent blocks' BLOCKHASH verification
@@ -308,27 +175,23 @@ pub fn execute_and_commit(input: &BatchInput) -> (BatchOutput, B256) {
         meta.last_block_timestamp_before,
     );
 
+    // Collect batch-level diffs from the CacheDB (comparing final state vs proven pre-state).
+    let (storage_diffs, _account_diffs) = collect_batch_diffs(&cache_db, input);
+
     // State after: compute new tree root by applying storage writes.
     // SOUND-3: verify tree update entries match what REVM actually computed.
     let last_block = input.blocks.last().unwrap();
 
-    // Note: system/upgrade/priority transactions produce 0x8003 account-property
-    // writes that REVM doesn't track. These are now verified explicitly in the
-    // reverse SOUND-3 check below (computed from account_diffs + preimages).
-
     let (tree_root_after, new_leaf_count) = if let Some(ref tree_update) = meta.tree_update {
         // Build map of REVM writes: flat_key -> new_value (storage diffs only)
-        let revm_write_map: HashMap<B256, B256> = output
-            .block_results
+        let revm_write_map: HashMap<B256, B256> = storage_diffs
             .iter()
-            .flat_map(|br| {
-                br.storage_diffs.iter().map(|d| {
-                    let addr_bytes: [u8; 20] = d.address.into_array();
-                    let slot = B256::from(d.slot.to_be_bytes::<32>());
-                    let flat_key = merkle::derive_flat_storage_key(&addr_bytes, &slot);
-                    let new_val = B256::from(d.new_value.to_be_bytes::<32>());
-                    (flat_key, new_val)
-                })
+            .map(|d| {
+                let addr_bytes: [u8; 20] = d.address.into_array();
+                let slot = B256::from(d.slot.to_be_bytes::<32>());
+                let flat_key = merkle::derive_flat_storage_key(&addr_bytes, &slot);
+                let new_val = B256::from(d.new_value.to_be_bytes::<32>());
+                (flat_key, new_val)
             })
             .collect();
 
@@ -366,8 +229,6 @@ pub fn execute_and_commit(input: &BatchInput) -> (BatchOutput, B256) {
                     extra_count += 1;
                 }
             }
-            // Extra entries should not exceed the total number of accounts in the batch.
-            // This bounds what a malicious server can do: at most N extra writes for N accounts.
             let total_accounts: usize = input.blocks.iter()
                 .map(|b| b.account_preimages.len() + b.accounts.len())
                 .sum();
@@ -383,12 +244,8 @@ pub fn execute_and_commit(input: &BatchInput) -> (BatchOutput, B256) {
         tree_update.apply(&meta.tree_root_before)
     } else {
         // No tree update — verify REVM produced no storage writes
-        let has_storage_writes = output
-            .block_results
-            .iter()
-            .any(|br| !br.storage_diffs.is_empty());
         assert!(
-            !has_storage_writes,
+            storage_diffs.is_empty(),
             "REVM produced storage writes but no tree_update proof was provided"
         );
         (meta.tree_root_before, meta.leaf_count_before)
@@ -575,45 +432,17 @@ pub fn execute_and_commit_debug(input: &BatchInput) -> (BatchOutput, B256, B256,
     (output, commitment, state_before, state_after, batch_hash)
 }
 
-/// Execute a single block with proof-verified state reads.
+/// Execute a single block using the shared batch-level CacheDB.
+/// Writes from this block remain in the CacheDB for subsequent blocks.
 fn execute_block_proven(
     chain_id: u64,
     spec_id: ZkSpecId,
     block: &BlockInput,
-    expected_root: &B256,
     batch_meta: &BatchMeta,
+    cache_db: &mut CacheDB<ProvenDB>,
 ) -> BlockResult {
-    let proven_db = build_proven_db(block, expected_root, batch_meta);
-    let cache_db = CacheDB::new(proven_db);
-    let (tx_results, storage_diffs, account_diffs, computed_l2_to_l1_logs) =
-        run_evm_and_collect_diffs(chain_id, spec_id, block, batch_meta, cache_db, false);
-    // In proven mode, verify every account that changed state has a verified
-    // "before" value. If an account's nonce/balance changed, its "before"
-    // value must come from a preimage (merkle-verified) or be provably zero
-    // (non-existence proof or genuinely new account).
-    let preimage_addrs: std::collections::HashSet<Address> =
-        block.account_preimages.iter().map(|(a, _)| *a).collect();
-    for diff in &account_diffs {
-        if !preimage_addrs.contains(&diff.address) {
-            // Account changed but has no preimage — "before" was assumed (0, 0).
-            // Check if there's an existing merkle proof that contradicts this.
-            let addr_bytes: [u8; 20] = diff.address.into_array();
-            let flat_key = merkle::derive_account_properties_key(&addr_bytes);
-            for (k, proof) in &block.storage_proofs {
-                if *k == flat_key {
-                    if let merkle::StorageProof::Existing(_) = proof {
-                        panic!(
-                            "account {} changed state but has no preimage, \
-                             while merkle proof shows it EXISTS. \
-                             Add an account_preimage for this address.",
-                            diff.address
-                        );
-                    }
-                    // NonExisting proof confirms before-state was truly zero — OK
-                }
-            }
-        }
-    }
+    let (tx_results, computed_l2_to_l1_logs) =
+        run_evm_block(chain_id, spec_id, block, batch_meta, cache_db, false);
 
     // Compute block header hash from execution results instead of trusting input.
     // This ensures the block_header_hash used in state_after is derived from
@@ -699,184 +528,201 @@ fn execute_block_proven(
         block_number: block.number,
         computed_block_header_hash: computed_header_hash,
         tx_results,
-        storage_diffs,
-        account_diffs,
         l2_to_l1_logs: computed_l2_to_l1_logs,
     }
 }
 
-/// Build a ProvenDB where all state is verified via merkle proofs.
-fn build_proven_db(block: &BlockInput, expected_root: &B256, batch_meta: &BatchMeta) -> ProvenDB {
-    // Verify all merkle proofs and extract values FROM the proofs
-    let mut storage_proofs = HashMap::new();
-    for (key, proof) in &block.storage_proofs {
-        // Verify proof recovers the expected root
-        let (root, _value) = proof
-            .verify(key)
-            .unwrap_or_else(|e| panic!("merkle proof failed for key {key}: {e}"));
+/// Build a ProvenDB for the entire batch.
+/// All merkle proofs from all blocks are verified at construction time and
+/// their values are stored in flat maps. Each block's proofs are verified
+/// against that block's expected tree root.
+fn build_proven_db(input: &BatchInput) -> ProvenDB {
+    let meta = &input.batch_meta;
+    let mut verified_storage: HashMap<B256, Option<B256>> = HashMap::new();
+    let mut verified_accounts: HashMap<Address, AccountInfo> = HashMap::new();
+    let mut bytecodes: HashMap<B256, Bytecode> = HashMap::new();
+    let mut block_hashes: HashMap<u64, B256> = HashMap::new();
 
-        assert_eq!(
-            root, *expected_root,
-            "proof for {key} recovers root {root}, expected {expected_root}"
-        );
-
-        storage_proofs.insert(*key, proof.clone());
+    // Collect all force_deploy_bytecodes across blocks for preimage lookups.
+    let mut all_force_deploy: HashMap<B256, &[u8]> = HashMap::new();
+    for block in &input.blocks {
+        for (hash, code) in &block.force_deploy_bytecodes {
+            all_force_deploy.insert(*hash, code.as_slice());
+        }
     }
 
-    // Build verified accounts from merkle proofs of address 0x8003.
-    // Each account's properties are stored at flat_key = derive_flat_storage_key(0x8003, left_padded_addr).
-    // The merkle proof verifies the value hash; the preimage decodes to nonce/balance/code_hash.
-    let mut verified_accounts = HashMap::new();
-    for (addr, preimage_bytes) in &block.account_preimages {
-        let addr_bytes: [u8; 20] = addr.into_array();
-        let flat_key = merkle::derive_account_properties_key(&addr_bytes);
-
-        // Verify the preimage hash matches what the merkle proof says
-        let preimage_hash = merkle::AccountProperties::hash(preimage_bytes);
-
-        // Look up the merkle proof for this account
-        let proof = storage_proofs.get(&flat_key).unwrap_or_else(|| {
-            panic!(
-                "no merkle proof for account {addr} (flat_key={flat_key}). \
-                 Every account_preimage must have a corresponding storage_proof."
-            )
-        });
-
-        let (root, proven_value) = proof
-            .verify(&flat_key)
-            .unwrap_or_else(|e| panic!("account proof failed for {addr}: {e}"));
-
-        assert_eq!(
-            root, *expected_root,
-            "account proof for {addr} recovers wrong root"
-        );
-
-        // For non-existing accounts (proof returns None), skip
-        let proven_val = match proven_value {
-            Some(v) => v,
-            None => continue,
-        };
-
-        assert_eq!(
-            proven_val, preimage_hash,
-            "account preimage hash mismatch for {addr}: \
-             proven value {proven_val}, preimage hash {preimage_hash}"
-        );
-
-        // Decode the preimage
-        let props = merkle::AccountProperties::decode(preimage_bytes);
-        let observable_code_hash = if props.observable_bytecode_hash.is_zero() {
-            // Empty account or no code — use KECCAK_EMPTY for REVM compatibility
-            if props.nonce == 0 && props.balance == [0u8; 32] {
-                B256::ZERO // truly empty
-            } else {
-                KECCAK_EMPTY
-            }
+    for block in &input.blocks {
+        let expected_root = if !block.expected_tree_root.is_zero() {
+            &block.expected_tree_root
         } else {
-            props.observable_bytecode_hash
+            &meta.tree_root_before
         };
 
-        verified_accounts.insert(
-            *addr,
-            AccountInfo {
-                nonce: props.nonce,
-                balance: U256::from_be_bytes(props.balance),
-                code_hash: observable_code_hash,
-                code: None,
-                account_id: None,
-            },
-        );
-    }
+        // Verify all merkle proofs and extract values FROM the proofs.
+        for (key, proof) in &block.storage_proofs {
+            let (root, value) = proof
+                .verify(key)
+                .unwrap_or_else(|e| panic!("merkle proof failed for key {key}: {e}"));
 
-    // Verify bytecodes: keccak256(code) must equal the provided hash.
-    let mut bytecodes = HashMap::new();
-    for (hash, code) in &block.bytecodes {
-        let computed_hash = alloy_primitives::keccak256(code);
-        assert_eq!(
-            computed_hash, *hash,
-            "bytecode hash mismatch: computed {computed_hash}, provided {hash}"
-        );
-        bytecodes.insert(*hash, Bytecode::new_raw(Bytes::copy_from_slice(code)));
-    }
-    // Force-deploy bytecodes keyed by ZKsync blake2s hash (includes artifacts).
-    // SOUND: verify blake2s(code) == hash, same as keccak bytecodes above.
-    for (hash, code) in &block.force_deploy_bytecodes {
-        let computed_hash = merkle::blake2s(code);
-        assert_eq!(
-            computed_hash, *hash,
-            "force-deploy bytecode hash mismatch: computed {computed_hash}, provided {hash}"
-        );
-        bytecodes.insert(*hash, Bytecode::new_raw(Bytes::copy_from_slice(code)));
-    }
+            assert_eq!(
+                root, *expected_root,
+                "proof for {key} recovers root {root}, expected {expected_root}"
+            );
 
-    // Verify block hashes against batch_meta.previous_block_hashes.
-    // The previous_block_hashes feeds into block_hashes_blake which is part
-    // of the state commitment verified on L1. Each block hash used by REVM's
-    // BLOCKHASH opcode must be consistent with this verified set.
-    let mut block_hashes = HashMap::new();
-    let block_number_before = batch_meta.block_number_before;
-    for &(num, hash) in &block.block_hashes {
-        // The previous_block_hashes array covers blocks [block_number_before-254 .. block_number_before].
-        // Index 0 in previous_block_hashes is the oldest (block_number_before - 254),
-        // index 254 is the most recent (block_number_before).
-        if block_number_before > 0 && num <= block_number_before {
-            let oldest_available = block_number_before.saturating_sub(254);
-            if num >= oldest_available {
-                let idx = (num - oldest_available) as usize;
-                if idx < batch_meta.previous_block_hashes.len() {
-                    let verified_hash = batch_meta.previous_block_hashes[idx];
-                    // Skip comparison for zero hashes (early chain state where
-                    // block hashes haven't been recorded yet).
-                    if !verified_hash.is_zero() {
-                        assert_eq!(
-                            hash, verified_hash,
-                            "block hash mismatch for block {num}: input={hash}, verified={verified_hash}"
-                        );
+            // First block's proof wins — later blocks may have the same key
+            // against a different root (after writes), but the pre-state value
+            // is what matters for the ProvenDB. Intra-batch updates go through CacheDB.
+            verified_storage.entry(*key).or_insert(value);
+        }
+
+        // Build verified accounts from merkle proofs of address 0x8003.
+        for (addr, preimage_bytes) in &block.account_preimages {
+            if verified_accounts.contains_key(addr) { continue; }
+            let addr_bytes: [u8; 20] = addr.into_array();
+            let flat_key = merkle::derive_account_properties_key(&addr_bytes);
+
+            let preimage_hash = merkle::AccountProperties::hash(preimage_bytes);
+
+            let proof = block.storage_proofs.iter()
+                .find(|(k, _)| *k == flat_key)
+                .map(|(_, p)| p)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "no merkle proof for account {addr} (flat_key={flat_key}). \
+                         Every account_preimage must have a corresponding storage_proof."
+                    )
+                });
+
+            let (root, proven_value) = proof
+                .verify(&flat_key)
+                .unwrap_or_else(|e| panic!("account proof failed for {addr}: {e}"));
+
+            assert_eq!(
+                root, *expected_root,
+                "account proof for {addr} recovers wrong root"
+            );
+
+            let proven_val = match proven_value {
+                Some(v) => v,
+                None => continue,
+            };
+
+            assert_eq!(
+                proven_val, preimage_hash,
+                "account preimage hash mismatch for {addr}: \
+                 proven value {proven_val}, preimage hash {preimage_hash}"
+            );
+
+            let props = merkle::AccountProperties::decode(preimage_bytes);
+            let observable_code_hash = if props.observable_bytecode_hash.is_zero() {
+                if props.nonce == 0 && props.balance == [0u8; 32] {
+                    B256::ZERO
+                } else {
+                    KECCAK_EMPTY
+                }
+            } else {
+                props.observable_bytecode_hash
+            };
+
+            // Preload bytecode using blake2s bytecode_hash from the preimage.
+            let code = if !props.bytecode_hash.is_zero() {
+                all_force_deploy.get(&props.bytecode_hash)
+                    .map(|padded_code| {
+                        let raw_len = props.unpadded_code_len as usize;
+                        let raw = if raw_len > 0 && raw_len <= padded_code.len() {
+                            &padded_code[..raw_len]
+                        } else {
+                            padded_code
+                        };
+                        Bytecode::new_raw(Bytes::copy_from_slice(raw))
+                    })
+            } else {
+                None
+            };
+
+            verified_accounts.insert(
+                *addr,
+                AccountInfo {
+                    nonce: props.nonce,
+                    balance: U256::from_be_bytes(props.balance),
+                    code_hash: observable_code_hash,
+                    code,
+                    account_id: None,
+                },
+            );
+        }
+
+        // Verify bytecodes: keccak256(code) must equal the provided hash.
+        for (hash, code) in &block.bytecodes {
+            if bytecodes.contains_key(hash) { continue; }
+            let computed_hash = alloy_primitives::keccak256(code);
+            assert_eq!(
+                computed_hash, *hash,
+                "bytecode hash mismatch: computed {computed_hash}, provided {hash}"
+            );
+            bytecodes.insert(*hash, Bytecode::new_raw(Bytes::copy_from_slice(code)));
+        }
+
+        // Force-deploy bytecodes keyed by ZKsync blake2s hash.
+        for (hash, code) in &block.force_deploy_bytecodes {
+            if bytecodes.contains_key(hash) { continue; }
+            let computed_hash = merkle::blake2s(code);
+            assert_eq!(
+                computed_hash, *hash,
+                "force-deploy bytecode hash mismatch: computed {computed_hash}, provided {hash}"
+            );
+            let bytecode = Bytecode::new_raw(Bytes::copy_from_slice(code));
+            bytecodes.insert(*hash, bytecode.clone());
+            let keccak_hash = alloy_primitives::keccak256(code);
+            bytecodes.insert(keccak_hash, bytecode);
+        }
+
+        // Verify block hashes against batch_meta.previous_block_hashes.
+        let block_number_before = meta.block_number_before;
+        for &(num, hash) in &block.block_hashes {
+            if block_number_before > 0 && num <= block_number_before {
+                let oldest_available = block_number_before.saturating_sub(254);
+                if num >= oldest_available {
+                    let idx = (num - oldest_available) as usize;
+                    if idx < meta.previous_block_hashes.len() {
+                        let verified_hash = meta.previous_block_hashes[idx];
+                        if !verified_hash.is_zero() {
+                            assert_eq!(
+                                hash, verified_hash,
+                                "block hash mismatch for block {num}: input={hash}, verified={verified_hash}"
+                            );
+                        }
                     }
                 }
             }
+            block_hashes.insert(num, hash);
         }
-        block_hashes.insert(num, hash);
-    }
 
-    // For accounts not in account_preimages, use block.accounts data for
-    // execution compatibility. On-demand basic_ref will verify via merkle
-    // proof if available; otherwise these provide the necessary pre-state.
-    // Post-execution, any account that CHANGED state must have a preimage
-    // (verified in execute_block_proven after run_evm_and_collect_diffs).
-    for (addr, data) in &block.accounts {
-        if verified_accounts.contains_key(addr) { continue; }
-        let code_hash = if data.code_hash.is_zero() {
-            if data.nonce == 0 && data.balance.is_zero() { continue; }
-            KECCAK_EMPTY
-        } else {
-            data.code_hash
-        };
-        verified_accounts.insert(*addr, AccountInfo {
-            nonce: data.nonce,
-            balance: data.balance,
-            code_hash,
-            code: None,
-            account_id: None,
-        });
+        // For accounts not in account_preimages, use block.accounts data.
+        for (addr, data) in &block.accounts {
+            if verified_accounts.contains_key(addr) { continue; }
+            let code_hash = if data.code_hash.is_zero() {
+                if data.nonce == 0 && data.balance.is_zero() { continue; }
+                KECCAK_EMPTY
+            } else {
+                data.code_hash
+            };
+            let code = bytecodes.get(&code_hash).cloned();
+            verified_accounts.insert(*addr, AccountInfo {
+                nonce: data.nonce,
+                balance: data.balance,
+                code_hash,
+                code,
+                account_id: None,
+            });
+        }
     }
-
-    // Collect raw preimages for on-demand account verification in basic_ref
-    let account_preimages_map: HashMap<Address, Vec<u8>> = block
-        .account_preimages
-        .iter()
-        .map(|(a, p)| (*a, p.clone()))
-        .collect();
 
     ProvenDB {
-        storage_proofs,
-        verified_storage: std::cell::RefCell::new(HashMap::new()),
+        verified_storage,
         verified_accounts,
-        verified_accounts_cache: std::cell::RefCell::new(HashMap::new()),
-        account_preimages: account_preimages_map,
         bytecodes,
         block_hashes,
-        expected_root: *expected_root,
     }
 }
 
@@ -1015,9 +861,11 @@ pub fn execute_batch(input: &BatchInput) -> BatchOutput {
         _ => panic!("unknown spec_id: {}", input.spec_id),
     };
 
+    let db = build_simple_db_batch(input);
+    let mut cache_db = CacheDB::new(db);
     let mut block_results = Vec::with_capacity(input.blocks.len());
     for block in &input.blocks {
-        block_results.push(execute_block_unverified(input.chain_id, spec_id, block, &input.batch_meta));
+        block_results.push(execute_block_unverified(input.chain_id, spec_id, block, &input.batch_meta, &mut cache_db));
     }
 
     BatchOutput {
@@ -1064,36 +912,36 @@ impl DatabaseRef for SimpleDB {
     }
 }
 
-fn build_simple_db(block: &BlockInput) -> SimpleDB {
+fn build_simple_db_batch(input: &BatchInput) -> SimpleDB {
     let mut accounts = HashMap::new();
-    for (addr, data) in &block.accounts {
-        accounts.insert(*addr, AccountInfo {
-            nonce: data.nonce,
-            balance: data.balance,
-            code_hash: if data.code_hash.is_zero() { KECCAK_EMPTY } else { data.code_hash },
-            code: None,
-            account_id: None,
-        });
-    }
     let mut storage = HashMap::new();
-    for &(addr, slot, value) in &block.storage {
-        storage.insert((addr, slot), value);
-    }
     let mut bytecodes = HashMap::new();
-    for (hash, code) in &block.bytecodes {
-        let bytecode = Bytecode::new_raw(Bytes::copy_from_slice(code));
-        bytecodes.insert(*hash, bytecode);
-    }
-    // Force-deploy bytecodes keyed by ZKsync blake2s hash (includes artifacts).
-    // The deployer precompile looks up by this hash.
-    for (hash, code) in &block.force_deploy_bytecodes {
-        let bytecode = Bytecode::new_raw(Bytes::copy_from_slice(code));
-        bytecodes.insert(*hash, bytecode);
-    }
     let mut block_hashes = HashMap::new();
-    for &(num, hash) in &block.block_hashes {
-        block_hashes.insert(num, hash);
+
+    for block in &input.blocks {
+        for (addr, data) in &block.accounts {
+            accounts.entry(*addr).or_insert_with(|| AccountInfo {
+                nonce: data.nonce,
+                balance: data.balance,
+                code_hash: if data.code_hash.is_zero() { KECCAK_EMPTY } else { data.code_hash },
+                code: None,
+                account_id: None,
+            });
+        }
+        for &(addr, slot, value) in &block.storage {
+            storage.entry((addr, slot)).or_insert(value);
+        }
+        for (hash, code) in &block.bytecodes {
+            bytecodes.entry(*hash).or_insert_with(|| Bytecode::new_raw(Bytes::copy_from_slice(code)));
+        }
+        for (hash, code) in &block.force_deploy_bytecodes {
+            bytecodes.entry(*hash).or_insert_with(|| Bytecode::new_raw(Bytes::copy_from_slice(code)));
+        }
+        for &(num, hash) in &block.block_hashes {
+            block_hashes.insert(num, hash);
+        }
     }
+
     SimpleDB { accounts, storage, bytecodes, block_hashes }
 }
 
@@ -1101,19 +949,21 @@ fn build_simple_db(block: &BlockInput) -> SimpleDB {
 // Shared EVM execution and diff collection
 // ---------------------------------------------------------------------------
 
-fn run_evm_and_collect_diffs<DB: DatabaseRef>(
+/// Execute a block's transactions in the EVM and return tx results + L2→L1 logs.
+/// State changes are written into the shared `cache_db`.
+fn run_evm_block<DB: DatabaseRef>(
     chain_id: u64,
     spec_id: ZkSpecId,
     block: &BlockInput,
     batch_meta: &BatchMeta,
-    mut cache_db: CacheDB<DB>,
+    cache_db: &mut CacheDB<DB>,
     allow_overrides: bool,
-) -> (Vec<TxOutput>, Vec<StorageDiff>, Vec<AccountDiff>, Vec<L2ToL1LogEntry>)
+) -> (Vec<TxOutput>, Vec<L2ToL1LogEntry>)
 where
     DB::Error: core::fmt::Debug,
 {
     let mut evm = <ZkContext<_>>::default()
-        .with_db(&mut cache_db)
+        .with_db(cache_db)
         .modify_cfg_chained(|cfg| {
             cfg.chain_id = chain_id;
             cfg.spec = spec_id;
@@ -1147,9 +997,6 @@ where
                 // For L1→L2 transactions (both priority and upgrade), emit the
                 // bootloader result log. In zksync-os, process_l1_transaction
                 // calls emit_l1_l2_tx_log for both is_priority_op=true and false.
-                //
-                // Priority txs have l1_tx_hash in the tx input.
-                // Upgrade txs (0x7e) have their hash in batch_meta.upgrade_tx_hash.
                 let bootloader_log_hash = if tx_input.is_l1_tx {
                     tx_input.l1_tx_hash
                 } else if tx_input.tx_type == 0x7e {
@@ -1162,9 +1009,6 @@ where
                     evm.0.ctx.chain.emit_l1_tx_result(tx_hash, success);
                 }
 
-                // Collect all L2→L1 logs from the chain context:
-                // - L1Messenger.sendToL1() logs (from precompile)
-                // - L1→L2 tx result logs (from emit_l1_tx_result above)
                 for log in evm.0.ctx.chain.take_logs() {
                     computed_l2_to_l1_logs.push(L2ToL1LogEntry {
                         l2_shard_id: log.l2_shard_id,
@@ -1186,24 +1030,30 @@ where
         }
     }
 
-    drop(evm);
+    (tx_results, computed_l2_to_l1_logs)
+}
 
-    // Build lookup maps for O(1) before-value access
-    let preimage_map: HashMap<Address, &[u8]> = block
-        .account_preimages
-        .iter()
-        .map(|(a, p)| (*a, p.as_slice()))
-        .collect();
-    let account_map: HashMap<Address, &AccountData> = block
-        .accounts
-        .iter()
-        .map(|(a, d)| (*a, d))
-        .collect();
-    let storage_map: HashMap<(Address, U256), U256> = block
-        .storage
-        .iter()
-        .map(|&(a, s, v)| ((a, s), v))
-        .collect();
+/// Collect storage and account diffs from the CacheDB after all blocks have executed.
+/// Compares the CacheDB's final state against the proven pre-state from all blocks.
+fn collect_batch_diffs(
+    cache_db: &CacheDB<ProvenDB>,
+    input: &BatchInput,
+) -> (Vec<StorageDiff>, Vec<AccountDiff>) {
+    // Build batch-level lookup maps for "before" values from all blocks' pre-state.
+    let mut preimage_map: HashMap<Address, &[u8]> = HashMap::new();
+    let mut account_map: HashMap<Address, &AccountData> = HashMap::new();
+    let mut storage_map: HashMap<(Address, U256), U256> = HashMap::new();
+    for block in &input.blocks {
+        for (a, p) in &block.account_preimages {
+            preimage_map.entry(*a).or_insert(p.as_slice());
+        }
+        for (a, d) in &block.accounts {
+            account_map.entry(*a).or_insert(d);
+        }
+        for &(a, s, v) in &block.storage {
+            storage_map.entry((a, s)).or_insert(v);
+        }
+    }
 
     let mut storage_diffs = Vec::new();
     let mut account_diffs = Vec::new();
@@ -1234,10 +1084,6 @@ where
                 balance_before,
                 balance_after: info.balance,
             });
-            // Note: 0x8003 AccountProperties writes are NOT emitted here because
-            // ZKsync's AccountProperties includes bytecode_hash (blake2s) which
-            // REVM cannot compute (it only knows keccak code_hash). The SOUND-3
-            // reverse check handles 0x8003 entries via expected_account_keys.
         }
         for (slot, value) in db_account.storage.iter() {
             let slot_u256 = U256::from_limbs((*slot).into_limbs());
@@ -1257,16 +1103,12 @@ where
         }
     }
 
-    (tx_results, storage_diffs, account_diffs, computed_l2_to_l1_logs)
+    (storage_diffs, account_diffs)
 }
 
-fn execute_block_unverified(chain_id: u64, spec_id: ZkSpecId, block: &BlockInput, batch_meta: &BatchMeta) -> BlockResult {
-    let db = build_simple_db(block);
-    let cache_db = CacheDB::new(db);
-    let (tx_results, storage_diffs, account_diffs, computed_logs) =
-        run_evm_and_collect_diffs(chain_id, spec_id, block, batch_meta, cache_db, true);
-    // Unverified mode: use computed logs (from EVM execution) if available,
-    // fall back to input logs for backward compat with inputs that lack EVM log data.
+fn execute_block_unverified(chain_id: u64, spec_id: ZkSpecId, block: &BlockInput, batch_meta: &BatchMeta, cache_db: &mut CacheDB<SimpleDB>) -> BlockResult {
+    let (tx_results, computed_logs) =
+        run_evm_block(chain_id, spec_id, block, batch_meta, cache_db, true);
     let l2_to_l1_logs = if computed_logs.is_empty() {
         block.l2_to_l1_logs.clone()
     } else {
@@ -1274,10 +1116,8 @@ fn execute_block_unverified(chain_id: u64, spec_id: ZkSpecId, block: &BlockInput
     };
     BlockResult {
         block_number: block.number,
-        computed_block_header_hash: block.block_header_hash, // unverified path trusts input
+        computed_block_header_hash: block.block_header_hash,
         tx_results,
-        storage_diffs,
-        account_diffs,
         l2_to_l1_logs,
     }
 }
