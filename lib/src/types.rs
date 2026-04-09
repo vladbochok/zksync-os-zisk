@@ -16,6 +16,10 @@ pub struct BatchInput {
     pub blocks: Vec<BlockInput>,
     /// Batch-level metadata for commitment computation.
     pub batch_meta: BatchMeta,
+    /// Contract bytecodes keyed by code hash (keccak256).
+    /// Shared across all blocks in the batch.
+    #[serde(default)]
+    pub bytecodes: Vec<(B256, Vec<u8>)>,
 }
 
 /// Batch-level metadata needed for the commitment hash.
@@ -75,8 +79,6 @@ pub struct BlockInput {
     pub account_preimages: Vec<(Address, Vec<u8>)>,
     /// Pre-state storage slots.
     pub storage: Vec<(Address, U256, U256)>,
-    /// Contract bytecodes keyed by code hash.
-    pub bytecodes: Vec<(B256, Vec<u8>)>,
     /// Block hashes for BLOCKHASH opcode.
     pub block_hashes: Vec<(u64, B256)>,
     /// Merkle proofs for every storage slot accessed. Key = flat_storage_key.
@@ -94,11 +96,6 @@ pub struct BlockInput {
     /// Defaults to B256::ZERO for backward compat (executor falls back to batch root).
     #[serde(default)]
     pub expected_tree_root: B256,
-    /// Force-deploy bytecodes keyed by their ZKsync blake2s hash (includes artifacts/padding).
-    /// Used by the deployer precompile during upgrade transactions.
-    /// These use a different hash scheme than `bytecodes` (which are keyed by keccak256).
-    #[serde(default)]
-    pub force_deploy_bytecodes: Vec<(B256, Vec<u8>)>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]

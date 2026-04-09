@@ -543,12 +543,11 @@ fn build_proven_db(input: &BatchInput) -> ProvenDB {
     let mut bytecodes: HashMap<B256, Bytecode> = HashMap::new();
     let mut block_hashes: HashMap<u64, B256> = HashMap::new();
 
-    // Collect all force_deploy_bytecodes across blocks for preimage lookups.
-    let mut all_force_deploy: HashMap<B256, &[u8]> = HashMap::new();
-    for block in &input.blocks {
-        for (hash, code) in &block.force_deploy_bytecodes {
-            all_force_deploy.insert(*hash, code.as_slice());
-        }
+    // Load batch-level bytecodes. Entries may be keyed by keccak256 (regular
+    // contracts) or blake2s (force-deployed system contracts). The key is
+    // whatever hash the EVM will use to look up the code.
+    for (hash, code) in &input.bytecodes {
+        bytecodes.insert(*hash, Bytecode::new_raw(Bytes::copy_from_slice(code)));
     }
 
     for block in &input.blocks {
@@ -624,21 +623,7 @@ fn build_proven_db(input: &BatchInput) -> ProvenDB {
                 props.observable_bytecode_hash
             };
 
-            // Preload bytecode using blake2s bytecode_hash from the preimage.
-            let code = if !props.bytecode_hash.is_zero() {
-                all_force_deploy.get(&props.bytecode_hash)
-                    .map(|padded_code| {
-                        let raw_len = props.unpadded_code_len as usize;
-                        let raw = if raw_len > 0 && raw_len <= padded_code.len() {
-                            &padded_code[..raw_len]
-                        } else {
-                            padded_code
-                        };
-                        Bytecode::new_raw(Bytes::copy_from_slice(raw))
-                    })
-            } else {
-                None
-            };
+            let code = bytecodes.get(&props.observable_bytecode_hash).cloned();
 
             verified_accounts.insert(
                 *addr,
@@ -650,31 +635,6 @@ fn build_proven_db(input: &BatchInput) -> ProvenDB {
                     account_id: None,
                 },
             );
-        }
-
-        // Verify bytecodes: keccak256(code) must equal the provided hash.
-        for (hash, code) in &block.bytecodes {
-            if bytecodes.contains_key(hash) { continue; }
-            let computed_hash = alloy_primitives::keccak256(code);
-            assert_eq!(
-                computed_hash, *hash,
-                "bytecode hash mismatch: computed {computed_hash}, provided {hash}"
-            );
-            bytecodes.insert(*hash, Bytecode::new_raw(Bytes::copy_from_slice(code)));
-        }
-
-        // Force-deploy bytecodes keyed by ZKsync blake2s hash.
-        for (hash, code) in &block.force_deploy_bytecodes {
-            if bytecodes.contains_key(hash) { continue; }
-            let computed_hash = merkle::blake2s(code);
-            assert_eq!(
-                computed_hash, *hash,
-                "force-deploy bytecode hash mismatch: computed {computed_hash}, provided {hash}"
-            );
-            let bytecode = Bytecode::new_raw(Bytes::copy_from_slice(code));
-            bytecodes.insert(*hash, bytecode.clone());
-            let keccak_hash = alloy_primitives::keccak256(code);
-            bytecodes.insert(keccak_hash, bytecode);
         }
 
         // Verify block hashes against batch_meta.previous_block_hashes.
@@ -918,6 +878,10 @@ fn build_simple_db_batch(input: &BatchInput) -> SimpleDB {
     let mut bytecodes = HashMap::new();
     let mut block_hashes = HashMap::new();
 
+    for (hash, code) in &input.bytecodes {
+        bytecodes.insert(*hash, Bytecode::new_raw(Bytes::copy_from_slice(code)));
+    }
+
     for block in &input.blocks {
         for (addr, data) in &block.accounts {
             accounts.entry(*addr).or_insert_with(|| AccountInfo {
@@ -930,12 +894,6 @@ fn build_simple_db_batch(input: &BatchInput) -> SimpleDB {
         }
         for &(addr, slot, value) in &block.storage {
             storage.entry((addr, slot)).or_insert(value);
-        }
-        for (hash, code) in &block.bytecodes {
-            bytecodes.entry(*hash).or_insert_with(|| Bytecode::new_raw(Bytes::copy_from_slice(code)));
-        }
-        for (hash, code) in &block.force_deploy_bytecodes {
-            bytecodes.entry(*hash).or_insert_with(|| Bytecode::new_raw(Bytes::copy_from_slice(code)));
         }
         for &(num, hash) in &block.block_hashes {
             block_hashes.insert(num, hash);

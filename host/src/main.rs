@@ -104,10 +104,6 @@ fn main() -> anyhow::Result<()> {
                 for (addr, data) in &block.accounts {
                     eprintln!("    {addr}: nonce={}, balance={}, code_hash={}", data.nonce, data.balance, data.code_hash);
                 }
-                eprintln!("  bytecodes: {}", block.bytecodes.len());
-                for (hash, code) in &block.bytecodes {
-                    eprintln!("    {hash}: {} bytes", code.len());
-                }
                 eprintln!("  storage slots: {}", block.storage.len());
                 for (addr, slot, val) in &block.storage {
                     if format!("{addr}").contains("800f") {
@@ -117,12 +113,6 @@ fn main() -> anyhow::Result<()> {
                 eprintln!("  account_preimages: {}", block.account_preimages.len());
                 for (addr, _) in &block.account_preimages {
                     eprintln!("    {addr}");
-                }
-                eprintln!("  force_deploy_bytecodes: {}", block.force_deploy_bytecodes.len());
-                for (hash, code) in &block.force_deploy_bytecodes {
-                    if format!("{hash}").contains("380faebb") || format!("{hash}").contains("828bb5b1") {
-                        eprintln!("    FOUND: {hash} ({} bytes)", code.len());
-                    }
                 }
                 eprintln!("  storage_proofs: {}", block.storage_proofs.len());
                 eprintln!("  transactions: {}", block.transactions.len());
@@ -301,10 +291,10 @@ fn make_sample_batch() -> BatchInput {
                 (coinbase, AccountData { nonce: 0, balance: U256::ZERO, code_hash: B256::ZERO }),
             ],
             account_preimages: vec![],
-            storage: vec![], bytecodes: vec![], block_hashes: vec![],
+            storage: vec![], block_hashes: vec![],
             l2_to_l1_logs: vec![],
             expected_tree_root: B256::ZERO,
-            force_deploy_bytecodes: vec![],
         }],
+        bytecodes: vec![],
     }
 }

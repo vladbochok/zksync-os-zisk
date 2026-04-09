@@ -180,11 +180,11 @@ mod tests {
                     signed_tx_bytes: Some(b"dummy-l1-tx".to_vec()),
                 }],
                 storage: vec![],
-                bytecodes: vec![],
                 block_hashes: vec![],
                 l2_to_l1_logs: vec![],
                 expected_tree_root: B256::ZERO,
             }],
+            bytecodes: vec![],
         };
 
         // Run the proven execution path
@@ -283,11 +283,11 @@ mod tests {
                     signed_tx_bytes: Some(b"dummy-l1-tx".to_vec()),
                 }],
                 storage: vec![],
-                bytecodes: vec![],
                 block_hashes: vec![],
                 l2_to_l1_logs: vec![],
                 expected_tree_root: B256::ZERO,
             }],
+            bytecodes: vec![],
         };
 
         // Serialize in ZiSK stdin format
@@ -372,11 +372,11 @@ mod tests {
                 accounts: vec![],
                 transactions: vec![],
                 storage: vec![],
-                bytecodes: vec![],
                 block_hashes: vec![],
                 l2_to_l1_logs: vec![],
                 expected_tree_root: B256::ZERO,
             }],
+            bytecodes: vec![],
         };
 
         // This should panic because preimage hash != proven value
@@ -403,39 +403,14 @@ mod tests {
 
         println!("Genesis batch: chain_id={}, blocks={}", batch.chain_id, batch.blocks.len());
         for (i, b) in batch.blocks.iter().enumerate() {
-            println!("  Block {}: {} txs, types: {:?}, {} bytecodes, {} accounts, {} account_preimages",
+            println!("  Block {}: {} txs, types: {:?}, {} accounts, {} account_preimages",
                 b.number, b.transactions.len(),
                 b.transactions.iter().map(|t| format!("0x{:02x}", t.tx_type)).collect::<Vec<_>>(),
-                b.bytecodes.len(), b.accounts.len(), b.account_preimages.len(),
+                b.accounts.len(), b.account_preimages.len(),
             );
             for tx in &b.transactions {
                 println!("    tx: caller={}, to={:?}, data_len={}, gas_limit={}, value={}",
                     tx.caller, tx.to, tx.data.len(), tx.gas_limit, tx.value);
-            }
-            // Show bytecodes hashes
-            println!("    bytecodes:");
-            for (hash, code) in &b.bytecodes {
-                println!("      {}: {} bytes", hash, code.len());
-            }
-            // Check if tx target's code is in bytecodes
-            for tx in &b.transactions {
-                if let Some(to) = tx.to {
-                    let acct = b.accounts.iter().find(|(a, _)| *a == to);
-                    if let Some((_, data)) = acct {
-                        let has_code = b.bytecodes.iter().any(|(h, _)| *h == data.code_hash);
-                        println!("    target {} code_hash={} in_bytecodes={}", to, data.code_hash, has_code);
-                        // Check if there's a bytecode whose keccak256 matches code_hash
-                        let has_keccak_match = b.bytecodes.iter().any(|(_, code)| {
-                            alloy_primitives::keccak256(code) == data.code_hash
-                        });
-                        println!("    target {} keccak_match={}", to, has_keccak_match);
-                        // Show first 3 bytecode hashes for comparison
-                        for (h, c) in b.bytecodes.iter().take(3) {
-                            let k = alloy_primitives::keccak256(c);
-                            println!("      bytecode_key={} keccak={} len={}", h, k, c.len());
-                        }
-                    }
-                }
             }
             // Show system contract accounts
             for (addr, data) in &b.accounts {
@@ -516,7 +491,7 @@ mod tests {
         );
         println!(
             "  bytecodes: {}",
-            batch_input.blocks.iter().map(|b| b.bytecodes.len()).sum::<usize>(),
+            batch_input.bytecodes.len(),
         );
 
         // Verify individual proof recovery against per-block expected_tree_root
