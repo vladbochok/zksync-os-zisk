@@ -234,33 +234,59 @@ impl BatchTreeUpdate {
             .map(|(pos, (idx, _))| (*idx, pos))
             .collect();
 
+        // When expected_root_after is set (merged multi-block updates), some
+        // operations may reference indices not in sorted_leaves. This is fine
+        // because we'll use the trusted root instead of recomputing. We still
+        // need to count inserts for the correct next_tree_index (leaf count).
+        let has_trusted_root = self.expected_root_after.is_some();
         for (op, (key, new_value)) in self.operations.iter().zip(&self.entries) {
             match op {
                 WriteOp::Update { index } => {
-                    let pos = pos_of[index];
-                    assert_eq!(leaves[pos].1.key, *key, "update key mismatch");
-                    leaves[pos].1.value = *new_value;
+                    if let Some(&pos) = pos_of.get(index) {
+                        assert_eq!(leaves[pos].1.key, *key, "update key mismatch");
+                        leaves[pos].1.value = *new_value;
+                    } else {
+                        assert!(has_trusted_root,
+                            "Update references unknown index {index} and no expected_root_after");
+                        // Skip — this key was added by an earlier block in a multi-block batch
+                        // and isn't in the first block's sorted_leaves. The trusted root handles it.
+                    }
                 }
                 WriteOp::Insert { prev_index } => {
                     let this_index = next_tree_index;
                     next_tree_index += 1;
 
-                    let prev_pos = pos_of[prev_index];
-                    let old_next = leaves[prev_pos].1.next_index;
+                    if let Some(&prev_pos) = pos_of.get(prev_index) {
+                        let old_next = leaves[prev_pos].1.next_index;
 
-                    let new_pos = leaves.len();
-                    leaves.push((
-                        this_index,
-                        TreeLeaf {
-                            key: *key,
-                            value: *new_value,
-                            next_index: old_next,
-                        },
-                    ));
-                    pos_of.insert(this_index, new_pos);
+                        let new_pos = leaves.len();
+                        leaves.push((
+                            this_index,
+                            TreeLeaf {
+                                key: *key,
+                                value: *new_value,
+                                next_index: old_next,
+                            },
+                        ));
+                        pos_of.insert(this_index, new_pos);
 
-                    // Update prev leaf's next_index (re-lookup pos since vec wasn't reordered)
-                    leaves[prev_pos].1.next_index = this_index;
+                        // Update prev leaf's next_index
+                        leaves[prev_pos].1.next_index = this_index;
+                    } else {
+                        assert!(has_trusted_root,
+                            "Insert references unknown prev_index {prev_index} and no expected_root_after");
+                        // Insert with unknown prev — just track the index for counting
+                        let new_pos = leaves.len();
+                        leaves.push((
+                            this_index,
+                            TreeLeaf {
+                                key: *key,
+                                value: *new_value,
+                                next_index: 0,
+                            },
+                        ));
+                        pos_of.insert(this_index, new_pos);
+                    }
                 }
             }
         }
