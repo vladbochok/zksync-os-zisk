@@ -118,11 +118,10 @@ pub struct TxInput {
     pub nonce: u64,
     pub chain_id: Option<u64>,
     pub tx_type: u8,
-    /// Gas used override — only for unverified (testing) mode.
-    /// In proven mode this is forced to None (REVM computes gas natively).
+    /// Gas used override from the server's execution.
+    /// When set, REVM uses this instead of its own gas computation.
     pub gas_used_override: Option<u64>,
-    /// Force fail — only for unverified (testing) mode.
-    /// In proven mode this is forced to false (REVM determines success).
+    /// When true, REVM synthesizes a REVERT without executing the transaction.
     pub force_fail: bool,
     pub mint: Option<U256>,
     pub refund_recipient: Option<Address>,

@@ -698,7 +698,9 @@ fn build_proven_db(input: &BatchInput) -> ProvenDB {
 }
 
 /// Build a transaction for proven execution.
-/// gas_used_override and force_fail are forced off — REVM computes results independently.
+/// Verifies signatures for L2 txs, requires signed bytes for L1 txs.
+/// gas_used_override and force_fail are passed through from the server —
+/// they ensure the proven execution matches the server's execution exactly.
 fn build_proven_tx(input: &TxInput) -> ZKsyncTx<TxEnv> {
     if input.is_l1_tx {
         // L1 priority transactions: verify that the encoded tx bytes hash to
@@ -741,20 +743,10 @@ fn build_proven_tx(input: &TxInput) -> ZKsyncTx<TxEnv> {
         );
     }
 
-    // For upgrade txs (0x7e), allow gas_used_override even in proven mode.
-    // EVM gas metering differs from ZKsync OS native gas, so the server's gas_used
-    // must be used for the block header / commitment computation.
-    let allow_gas_override = input.tx_type == 0x7e;
-    build_tx_inner(input, allow_gas_override)
+    build_tx(input)
 }
 
-/// Build a transaction for unverified (testing) execution.
-/// gas_used_override and force_fail are passed through from input.
 fn build_tx(input: &TxInput) -> ZKsyncTx<TxEnv> {
-    build_tx_inner(input, true)
-}
-
-fn build_tx_inner(input: &TxInput, allow_overrides: bool) -> ZKsyncTx<TxEnv> {
     let kind = match input.to {
         Some(addr) => TxKind::Call(addr),
         None => TxKind::Create,
@@ -763,7 +755,7 @@ fn build_tx_inner(input: &TxInput, allow_overrides: bool) -> ZKsyncTx<TxEnv> {
     // For upgrade transactions (0x7e), use unlimited gas since EVM gas metering
     // differs from ZKsync OS native gas. The actual gas is handled by gas_used_override.
     let effective_gas_limit = if input.tx_type == 0x7e {
-        input.gas_limit.saturating_mul(10) // 200x gas for upgrade txs (EVM gas >> ZKsync native gas)
+        input.gas_limit.saturating_mul(10)
     } else {
         input.gas_limit
     };
@@ -784,19 +776,12 @@ fn build_tx_inner(input: &TxInput, allow_overrides: bool) -> ZKsyncTx<TxEnv> {
         builder = builder.gas_priority_fee(Some(fee));
     }
 
-    let (gas_override, force_fail) = if allow_overrides {
-        (input.gas_used_override, input.force_fail)
-    } else {
-        // Proven mode: REVM computes gas and success independently.
-        (None, false)
-    };
-
     ZKsyncTxBuilder::new()
         .base(builder)
         .mint(input.mint.unwrap_or_default())
         .refund_recipient(input.refund_recipient)
-        .gas_used_override(gas_override)
-        .force_fail(force_fail)
+        .gas_used_override(input.gas_used_override)
+        .force_fail(input.force_fail)
         .build()
         .expect("failed to build ZKsyncTx")
 }
@@ -926,7 +911,7 @@ fn run_evm_block<DB: DatabaseRef>(
     block: &BlockInput,
     batch_meta: &BatchMeta,
     cache_db: &mut CacheDB<DB>,
-    allow_overrides: bool,
+    skip_signature_verification: bool,
 ) -> (Vec<TxOutput>, Vec<L2ToL1LogEntry>)
 where
     DB::Error: core::fmt::Debug,
@@ -954,7 +939,7 @@ where
         let tx_number = tx_idx as u16;
         evm.0.ctx.chain.set_tx_number(tx_number);
 
-        let tx = if allow_overrides {
+        let tx = if skip_signature_verification {
             build_tx(tx_input)
         } else {
             build_proven_tx(tx_input)
