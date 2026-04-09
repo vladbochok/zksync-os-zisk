@@ -35,6 +35,8 @@ struct ProvenDB {
     verified_storage: std::cell::RefCell<HashMap<B256, Option<B256>>>,
     /// Account data decoded from account-properties merkle proofs.
     verified_accounts: HashMap<Address, AccountInfo>,
+    /// Raw account preimages for on-demand account verification.
+    account_preimages: HashMap<Address, Vec<u8>>,
     /// Verified bytecodes: keccak256(code) checked against hash at load time.
     bytecodes: HashMap<B256, Bytecode>,
     /// Block hashes for BLOCKHASH opcode.
@@ -59,7 +61,67 @@ impl DatabaseRef for ProvenDB {
     type Error = ProvenDBError;
 
     fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
-        Ok(self.verified_accounts.get(&address).cloned())
+        // First check pre-verified accounts (from preimages in build_proven_db)
+        if let Some(info) = self.verified_accounts.get(&address) {
+            return Ok(Some(info.clone()));
+        }
+
+        // SOUND: for accounts not pre-verified, check the merkle proof on-demand.
+        // A malicious server cannot hide accounts by omitting preimages — we verify
+        // the proof here and panic if the account exists but has no preimage.
+        let addr_bytes: [u8; 20] = address.into_array();
+        let flat_key = merkle::derive_account_properties_key(&addr_bytes);
+        if let Some(proof) = self.storage_proofs.get(&flat_key) {
+            let (root, proven_value) = proof
+                .verify(&flat_key)
+                .map_err(|e| ProvenDBError(format!("account proof failed for {address}: {e}")))?;
+            if root != self.expected_root {
+                return Err(ProvenDBError(format!(
+                    "account proof for {address} recovers wrong root: {root} != {}",
+                    self.expected_root
+                )));
+            }
+            match proven_value {
+                Some(proven_hash) => {
+                    // Account EXISTS in the tree — it MUST have a preimage.
+                    // If we reach here, the server provided a proof but no preimage.
+                    if let Some(preimage) = self.account_preimages.get(&address) {
+                        let computed_hash = merkle::AccountProperties::hash(preimage);
+                        assert_eq!(
+                            computed_hash, proven_hash,
+                            "account preimage hash mismatch for {address}"
+                        );
+                        let props = merkle::AccountProperties::decode(preimage);
+                        Ok(Some(AccountInfo {
+                            nonce: props.nonce,
+                            balance: U256::from_be_bytes(props.balance),
+                            code_hash: if props.bytecode_hash.is_zero() {
+                                KECCAK_EMPTY
+                            } else {
+                                props.bytecode_hash
+                            },
+                            code: None,
+                            account_id: None,
+                        }))
+                    } else {
+                        Err(ProvenDBError(format!(
+                            "account {address} exists in merkle tree (proven_hash={proven_hash}) \
+                             but no preimage provided. The server must include preimages for \
+                             all existing accounts."
+                        )))
+                    }
+                }
+                None => {
+                    // Account proven to NOT exist — return None (empty account)
+                    Ok(None)
+                }
+            }
+        } else {
+            // No proof for this address. This is acceptable for addresses that
+            // are created during execution (e.g., CREATE target) or system addresses
+            // that are accessed but don't exist in the state tree yet.
+            Ok(None)
+        }
     }
 
     fn code_by_hash_ref(&self, code_hash: B256) -> Result<Bytecode, Self::Error> {
@@ -691,35 +753,22 @@ fn build_proven_db(block: &BlockInput, expected_root: &B256, batch_meta: &BatchM
         block_hashes.insert(num, hash);
     }
 
-    // SOUND: For accounts not in account_preimages, verify via merkle proof
-    // that they truly don't exist. Existing accounts MUST have preimages.
-    // A malicious server cannot fabricate nonce/balance for any account.
-    for (addr, _data) in &block.accounts {
-        if verified_accounts.contains_key(addr) { continue; }
-        let addr_bytes: [u8; 20] = addr.into_array();
-        let flat_key = merkle::derive_account_properties_key(&addr_bytes);
-        if let Some(proof) = storage_proofs.get(&flat_key) {
-            let (root, proven_value) = proof
-                .verify(&flat_key)
-                .unwrap_or_else(|e| panic!("account proof failed for {addr}: {e}"));
-            assert_eq!(
-                root, *expected_root,
-                "account proof for {addr} recovers wrong root"
-            );
-            assert!(
-                proven_value.is_none(),
-                "account {addr} exists in merkle tree but has no preimage. \
-                 The server must provide account_preimages for all existing accounts."
-            );
-            // Non-existing account confirmed by proof — REVM will treat as empty
-        }
-        // If no proof at all, the account isn't accessed by REVM — skip
-    }
+    // Account verification is now done on-demand in ProvenDB::basic_ref.
+    // When REVM accesses an account not in verified_accounts, basic_ref
+    // verifies it via merkle proof (existing → requires preimage, non-existing → Ok(None)).
+
+    // Collect raw preimages for on-demand account verification in basic_ref
+    let account_preimages_map: HashMap<Address, Vec<u8>> = block
+        .account_preimages
+        .iter()
+        .map(|(a, p)| (*a, p.clone()))
+        .collect();
 
     ProvenDB {
         storage_proofs,
         verified_storage: std::cell::RefCell::new(HashMap::new()),
         verified_accounts,
+        account_preimages: account_preimages_map,
         bytecodes,
         block_hashes,
         expected_root: *expected_root,
