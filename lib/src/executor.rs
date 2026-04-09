@@ -57,8 +57,20 @@ impl DatabaseRef for ProvenDB {
     type Error = ProvenDBError;
 
     fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
-        match self.verified_accounts.get(&address) {
-            Some(proven) => Ok(proven.clone()),
+        // Fast path: account was pre-verified from account_preimages
+        if let Some(proven) = self.verified_accounts.get(&address) {
+            return Ok(proven.clone());
+        }
+
+        // Slow path: check verified_storage for account-property proof.
+        // The server may include a proof without a preimage (for non-existent accounts).
+        let addr_bytes: [u8; 20] = address.into_array();
+        let flat_key = merkle::derive_account_properties_key(&addr_bytes);
+        match self.verified_storage.get(&flat_key) {
+            Some(None) => Ok(None), // proven non-existent
+            Some(Some(_)) => Err(ProvenDBError(format!(
+                "account {address} exists in merkle tree but no preimage in account_preimages"
+            ))),
             None => Err(ProvenDBError(format!(
                 "no proof for account {address}. The server must provide a merkle proof \
                  (existence or non-existence) for every account REVM accesses."

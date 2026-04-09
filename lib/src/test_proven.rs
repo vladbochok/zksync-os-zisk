@@ -481,6 +481,22 @@ mod tests {
             batch_input.bytecodes.len(),
         );
 
+        // Show account preimages
+        for block in &batch_input.blocks {
+            println!("  account_preimages ({}):", block.account_preimages.len());
+            for (addr, _) in &block.account_preimages {
+                println!("    {addr}");
+            }
+        }
+
+        // Check if 0x8007 has a proof
+        let target: Address = "0x0000000000000000000000000000000000008007".parse().unwrap();
+        let target_key = crate::merkle::derive_account_properties_key(&target.into_array());
+        for block in &batch_input.blocks {
+            let has_proof = block.storage_proofs.iter().any(|(k, _)| *k == target_key);
+            println!("  0x8007 proof exists: {has_proof} (flat_key={target_key})");
+        }
+
         // Verify individual proof recovery against per-block expected_tree_root
         for block in &batch_input.blocks {
             let expected = if !block.expected_tree_root.is_zero() {
