@@ -184,9 +184,17 @@ pub fn execute_and_commit(input: &BatchInput) -> (BatchOutput, B256) {
     // SOUND-3: verify tree update entries match what REVM actually computed.
     let last_block = input.blocks.last().unwrap();
 
-    // Check if batch contains system/upgrade transactions
+    // Check if batch contains system/upgrade/priority transactions.
+    // These produce additional storage writes (via bootloader, system contracts)
+    // that REVM doesn't track, so the tree_update may have extra entries.
+    // Priority L1→L2 txs (0xff/0x71) also produce system contract writes.
     let has_system_txs = input.blocks.iter().any(|b| {
-        b.transactions.iter().any(|tx| tx.tx_type == 0x7e || tx.tx_type == 0x7f)
+        b.transactions.iter().any(|tx| {
+            tx.tx_type == 0x7e  // upgrade
+                || tx.tx_type == 0x7f  // system
+                || tx.tx_type == 0xff  // L1→L2 priority (legacy)
+                || tx.tx_type == 0x71  // L1→L2 priority (EIP-712)
+        })
     });
 
     let (tree_root_after, new_leaf_count) = if let Some(ref tree_update) = meta.tree_update {
@@ -223,9 +231,14 @@ pub fn execute_and_commit(input: &BatchInput) -> (BatchOutput, B256) {
         }
 
         // Reverse check: tree_update writes must also be in REVM writes.
-        // Exception: system/upgrade transactions produce additional writes
-        // via bootloader and system contracts that REVM doesn't see.
-        if !has_system_txs {
+        // Exceptions:
+        //   - System/upgrade/priority transactions produce additional writes
+        //     via bootloader and system contracts that REVM doesn't see.
+        //   - Merged multi-block tree_updates (indicated by expected_root_after)
+        //     may include entries from blocks with system txs even if the
+        //     current batch's tx types don't include them.
+        let is_merged = tree_update.expected_root_after.is_some();
+        if !has_system_txs && !is_merged {
             for tree_key in tree_write_map.keys() {
                 assert!(
                     revm_write_map.contains_key(tree_key),
