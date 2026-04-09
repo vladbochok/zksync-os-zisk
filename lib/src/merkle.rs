@@ -16,7 +16,7 @@ pub const TREE_DEPTH: u8 = 64;
 // Blake2s helpers
 // ---------------------------------------------------------------------------
 
-fn blake2s(data: &[u8]) -> B256 {
+pub fn blake2s(data: &[u8]) -> B256 {
     let mut h = Blake2s256::new();
     h.update(data);
     B256::from_slice(&h.finalize_fixed())

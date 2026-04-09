@@ -651,7 +651,13 @@ fn build_proven_db(block: &BlockInput, expected_root: &B256, batch_meta: &BatchM
         bytecodes.insert(*hash, Bytecode::new_raw(Bytes::copy_from_slice(code)));
     }
     // Force-deploy bytecodes keyed by ZKsync blake2s hash (includes artifacts).
+    // SOUND: verify blake2s(code) == hash, same as keccak bytecodes above.
     for (hash, code) in &block.force_deploy_bytecodes {
+        let computed_hash = merkle::blake2s(code);
+        assert_eq!(
+            computed_hash, *hash,
+            "force-deploy bytecode hash mismatch: computed {computed_hash}, provided {hash}"
+        );
         bytecodes.insert(*hash, Bytecode::new_raw(Bytes::copy_from_slice(code)));
     }
 
@@ -685,31 +691,29 @@ fn build_proven_db(block: &BlockInput, expected_root: &B256, batch_meta: &BatchM
         block_hashes.insert(num, hash);
     }
 
-    // For accounts not in account_preimages (no merkle proof), fall back to
-    // block.accounts data. Skip accounts with non-zero code_hash that have
-    // force_deploy_bytecodes — these will be deployed by the upgrade tx and
-    // must start with empty code for the deployment check to work.
-    let has_force_deploys = !block.force_deploy_bytecodes.is_empty();
-    for (addr, data) in &block.accounts {
+    // SOUND: For accounts not in account_preimages, verify via merkle proof
+    // that they truly don't exist. Existing accounts MUST have preimages.
+    // A malicious server cannot fabricate nonce/balance for any account.
+    for (addr, _data) in &block.accounts {
         if verified_accounts.contains_key(addr) { continue; }
-        // If this block has force deployments and this account has code,
-        // skip it — the upgrade code will deploy it and checks code.length == 0.
-        if has_force_deploys && !data.code_hash.is_zero() {
-            continue;
+        let addr_bytes: [u8; 20] = addr.into_array();
+        let flat_key = merkle::derive_account_properties_key(&addr_bytes);
+        if let Some(proof) = storage_proofs.get(&flat_key) {
+            let (root, proven_value) = proof
+                .verify(&flat_key)
+                .unwrap_or_else(|e| panic!("account proof failed for {addr}: {e}"));
+            assert_eq!(
+                root, *expected_root,
+                "account proof for {addr} recovers wrong root"
+            );
+            assert!(
+                proven_value.is_none(),
+                "account {addr} exists in merkle tree but has no preimage. \
+                 The server must provide account_preimages for all existing accounts."
+            );
+            // Non-existing account confirmed by proof — REVM will treat as empty
         }
-        let code_hash = if data.code_hash.is_zero() {
-            if data.nonce == 0 && data.balance.is_zero() { continue; }
-            KECCAK_EMPTY
-        } else {
-            data.code_hash
-        };
-        verified_accounts.insert(*addr, AccountInfo {
-            nonce: data.nonce,
-            balance: data.balance,
-            code_hash,
-            code: None,
-            account_id: None,
-        });
+        // If no proof at all, the account isn't accessed by REVM — skip
     }
 
     ProvenDB {
@@ -1082,7 +1086,6 @@ where
             // Airbender VM produces — so the SOUND-3 reverse check works
             // without any special-casing for system/priority txs.
             let addr_bytes: [u8; 20] = addr.into_array();
-            let account_flat_key = merkle::derive_account_properties_key(&addr_bytes);
             let new_preimage = if let Some(preimage) = preimage_map.get(addr) {
                 let mut buf = preimage.to_vec();
                 buf.resize(merkle::AccountProperties::ENCODED_SIZE, 0);
