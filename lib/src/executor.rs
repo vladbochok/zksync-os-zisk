@@ -255,21 +255,45 @@ pub fn execute_and_commit(input: &BatchInput) -> (BatchOutput, B256) {
     }
 
     let mut block_results = Vec::with_capacity(input.blocks.len());
+    // For multi-block batches, the tree root changes after each block.
+    // The first block uses meta.tree_root_before (verified via tree_update old root check).
+    // Subsequent blocks use expected_tree_root from the server — this is a trust assumption
+    // that we accept because the batch-level tree_update verifies the final root against
+    // the batch-start root + all writes. Intermediate roots are not independently verifiable
+    // without the full tree, but the final state IS verified.
+    //
+    // Track computed block header hashes to cross-verify intra-batch BLOCKHASH usage.
+    let mut computed_block_hashes: HashMap<u64, B256> = HashMap::new();
     for block in &input.blocks {
-        // Each block's merkle proofs were extracted from its own tree version.
-        // Use the per-block expected_tree_root if set, otherwise fall back to batch root.
+        // Verify intra-batch block hashes: if this block references a previous block
+        // in the same batch via block_hashes, check it matches the computed hash.
+        for &(num, hash) in &block.block_hashes {
+            if let Some(&computed) = computed_block_hashes.get(&num) {
+                assert_eq!(
+                    hash, computed,
+                    "intra-batch block hash mismatch for block {num}: \
+                     server provided {hash}, computed {computed}"
+                );
+            }
+        }
+
         let tree_root = if !block.expected_tree_root.is_zero() {
             &block.expected_tree_root
         } else {
             &meta.tree_root_before
         };
-        block_results.push(execute_block_proven(
+        let result = execute_block_proven(
             input.chain_id,
             spec_id,
             block,
             tree_root,
             meta,
-        ));
+        );
+
+        // Record the computed block header hash for subsequent blocks' BLOCKHASH verification
+        computed_block_hashes.insert(block.number, result.computed_block_header_hash);
+
+        block_results.push(result);
     }
 
     let output = BatchOutput {
