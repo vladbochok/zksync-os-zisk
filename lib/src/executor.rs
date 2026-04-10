@@ -177,7 +177,6 @@ pub fn execute_and_commit(input: &BatchInput) -> (BatchOutput, B256) {
             input.chain_id,
             spec_id,
             block,
-            meta,
             &mut cache_db,
         );
         all_deployed_bytecodes.extend(deployed_bytecodes);
@@ -206,7 +205,7 @@ pub fn execute_and_commit(input: &BatchInput) -> (BatchOutput, B256) {
     );
 
     // Collect batch-level diffs from the CacheDB (comparing final state vs proven pre-state).
-    let (storage_diffs, _account_diffs) = collect_batch_diffs(&cache_db, input);
+    let (storage_diffs, account_diffs) = collect_batch_diffs(&cache_db, input);
 
     // State after: compute new tree root by applying storage writes.
     // SOUND-3: verify tree update entries match what REVM actually computed.
@@ -249,7 +248,7 @@ pub fn execute_and_commit(input: &BatchInput) -> (BatchOutput, B256) {
         {
             let mut expected_account_keys: std::collections::HashSet<B256> = std::collections::HashSet::new();
             // Accounts with nonce/balance changes
-            for diff in &_account_diffs {
+            for diff in &account_diffs {
                 let addr_bytes: [u8; 20] = diff.address.into_array();
                 expected_account_keys.insert(merkle::derive_account_properties_key(&addr_bytes));
             }
@@ -477,11 +476,10 @@ fn execute_block_proven(
     chain_id: u64,
     spec_id: ZkSpecId,
     block: &BlockInput,
-    batch_meta: &BatchMeta,
     cache_db: &mut CacheDB<ProvenDB>,
 ) -> (BlockResult, Vec<(Address, B256)>) {
     let (tx_results, computed_l2_to_l1_logs, deployed_bytecodes) =
-        run_evm_block(chain_id, spec_id, block, batch_meta, cache_db, false);
+        run_evm_block(chain_id, spec_id, block, cache_db);
 
     // Compute block header hash from execution results instead of trusting input.
     // This ensures the block_header_hash used in state_after is derived from
@@ -842,107 +840,6 @@ fn recover_signer(signed_bytes: &[u8]) -> Address {
 }
 
 
-// ---------------------------------------------------------------------------
-// Legacy unverified execution (for testing / backward compatibility)
-// ---------------------------------------------------------------------------
-
-/// Execute without proof verification (for testing only).
-pub fn execute_batch(input: &BatchInput) -> BatchOutput {
-    let spec_id = match input.spec_id {
-        0 => ZkSpecId::AtlasV1,
-        1 => ZkSpecId::AtlasV2,
-        _ => panic!("unknown spec_id: {}", input.spec_id),
-    };
-
-    let db = build_simple_db_batch(input);
-    let mut cache_db = CacheDB::new(db);
-    let mut block_results = Vec::with_capacity(input.blocks.len());
-    for block in &input.blocks {
-        block_results.push(execute_block_unverified(input.chain_id, spec_id, block, &input.batch_meta, &mut cache_db));
-    }
-
-    BatchOutput {
-        chain_id: input.chain_id,
-        block_results,
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Simple unverified DB (used by execute_batch for testing)
-// ---------------------------------------------------------------------------
-
-struct SimpleDB {
-    accounts: HashMap<Address, AccountInfo>,
-    storage: HashMap<(Address, U256), U256>,
-    bytecodes: HashMap<B256, Bytecode>,
-    block_hashes: HashMap<u64, B256>,
-}
-
-#[derive(Debug)]
-struct SimpleDBError;
-impl core::fmt::Display for SimpleDBError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "db error")
-    }
-}
-impl std::error::Error for SimpleDBError {}
-impl DBErrorMarker for SimpleDBError {}
-
-
-impl DatabaseRef for SimpleDB {
-    type Error = SimpleDBError;
-    fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
-        Ok(self.accounts.get(&address).cloned())
-    }
-    fn code_by_hash_ref(&self, code_hash: B256) -> Result<Bytecode, Self::Error> {
-        Ok(self.bytecodes.get(&code_hash).cloned().unwrap_or_default())
-    }
-    fn storage_ref(&self, address: Address, index: U256) -> Result<U256, Self::Error> {
-        Ok(self.storage.get(&(address, index)).copied().unwrap_or_default())
-    }
-    fn block_hash_ref(&self, number: u64) -> Result<B256, Self::Error> {
-        Ok(self.block_hashes.get(&number).copied().unwrap_or_default())
-    }
-}
-
-fn build_simple_db_batch(input: &BatchInput) -> SimpleDB {
-    let mut accounts = HashMap::new();
-    let mut storage = HashMap::new();
-    let mut bytecodes = HashMap::new();
-    let mut block_hashes = HashMap::new();
-
-    for (hash, code) in &input.bytecodes {
-        bytecodes.insert(*hash, Bytecode::new_raw(Bytes::copy_from_slice(code)));
-    }
-
-    for block in &input.blocks {
-        for (addr, preimage) in &block.account_preimages {
-            accounts.entry(*addr).or_insert_with(|| {
-                let props = merkle::AccountProperties::decode(preimage);
-                let code_hash = if props.observable_bytecode_hash.is_zero() {
-                    KECCAK_EMPTY
-                } else {
-                    props.observable_bytecode_hash
-                };
-                AccountInfo {
-                    nonce: props.nonce,
-                    balance: U256::from_be_bytes(props.balance),
-                    code_hash,
-                    code: None,
-                    account_id: None,
-                }
-            });
-        }
-        for &(addr, slot, value) in &block.storage {
-            storage.entry((addr, slot)).or_insert(value);
-        }
-        for &(num, hash) in &block.block_hashes {
-            block_hashes.insert(num, hash);
-        }
-    }
-
-    SimpleDB { accounts, storage, bytecodes, block_hashes }
-}
 
 // ---------------------------------------------------------------------------
 // Shared EVM execution and diff collection
@@ -954,9 +851,7 @@ fn run_evm_block<DB: DatabaseRef>(
     chain_id: u64,
     spec_id: ZkSpecId,
     block: &BlockInput,
-    batch_meta: &BatchMeta,
     cache_db: &mut CacheDB<DB>,
-    skip_signature_verification: bool,
 ) -> (Vec<TxOutput>, Vec<L2ToL1LogEntry>, Vec<(Address, B256)>)
 where
     DB::Error: core::fmt::Debug,
@@ -984,11 +879,7 @@ where
         let tx_number = tx_idx as u16;
         evm.0.ctx.chain.set_tx_number(tx_number);
 
-        let tx = if skip_signature_verification {
-            build_tx(tx_input)
-        } else {
-            build_proven_tx(tx_input)
-        };
+        let tx = build_proven_tx(tx_input);
         match evm.transact_commit(tx) {
             Ok(result) => {
                 // L1 tx result log is emitted automatically by the handler's
@@ -1084,22 +975,6 @@ fn collect_batch_diffs(
     (storage_diffs, account_diffs)
 }
 
-fn execute_block_unverified(chain_id: u64, spec_id: ZkSpecId, block: &BlockInput, batch_meta: &BatchMeta, cache_db: &mut CacheDB<SimpleDB>) -> BlockResult {
-    let (tx_results, computed_logs, _deployed) =
-        run_evm_block(chain_id, spec_id, block, batch_meta, cache_db, true);
-    let l2_to_l1_logs = if computed_logs.is_empty() {
-        block.l2_to_l1_logs.clone()
-    } else {
-        computed_logs
-    };
-    BlockResult {
-        block_number: block.number,
-        computed_block_header_hash: block.block_header_hash,
-        tx_results,
-        l2_to_l1_logs,
-    }
-}
-
 /// Execute a batch from bincode-serialized BatchInput bytes.
 /// Returns the output and batch commitment hash.
 /// Used by the server to compute ZiSK commitments in-process.
@@ -1111,8 +986,3 @@ pub fn execute_and_commit_from_bincode(
     Ok(execute_and_commit(&batch_input))
 }
 
-/// Legacy output hash (for backward compat with tests).
-pub fn compute_output_hash(output: &BatchOutput) -> [u8; 32] {
-    let encoded = bincode::serialize(output).expect("serialization cannot fail");
-    alloy_primitives::keccak256(&encoded).into()
-}

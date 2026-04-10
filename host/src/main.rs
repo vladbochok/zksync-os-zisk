@@ -59,7 +59,7 @@ fn main() -> anyhow::Result<()> {
                 batch_input.chain_id, batch_input.blocks.len(),
                 batch_input.blocks.iter().map(|b| b.transactions.len()).sum::<usize>()
             );
-            let output = executor::execute_batch(&batch_input);
+            let (output, commitment) = executor::execute_and_commit(&batch_input);
             for br in &output.block_results {
                 eprintln!("\n--- Block {} ---", br.block_number);
                 for (i, tx) in br.tx_results.iter().enumerate() {
@@ -67,8 +67,7 @@ fn main() -> anyhow::Result<()> {
                 }
                 eprintln!("  l2_to_l1_logs: {}", br.l2_to_l1_logs.len());
             }
-            let hash = executor::compute_output_hash(&output);
-            eprintln!("\nOutput hash: 0x{}", hex::encode(hash));
+            eprintln!("\nCommitment: {commitment}");
         }
 
         Commands::DebugCommitment { input } => {
