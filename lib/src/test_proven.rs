@@ -191,9 +191,7 @@ mod tests {
                     force_fail: true,
                     mint: None,
                     refund_recipient: Some(sender),
-                    is_l1_tx: true,
-                    l1_tx_hash: Some(l1_tx_hash),
-                    signed_tx_bytes: Some(l1_abi.clone()),
+                    auth: TxAuth::L1 { tx_hash: l1_tx_hash, abi_encoded: l1_abi.clone() },
                 }],
                 storage: vec![],
                 block_hashes: vec![],
@@ -296,9 +294,10 @@ mod tests {
                     force_fail: false,
                     mint: None,
                     refund_recipient: None,
-                    is_l1_tx: true, // use L1 to skip ecrecover in unit test
-                    l1_tx_hash: Some(alloy_primitives::keccak256(b"dummy-l1-tx")),
-                    signed_tx_bytes: Some(b"dummy-l1-tx".to_vec()),
+                    auth: TxAuth::L1 {
+                        tx_hash: alloy_primitives::keccak256(b"dummy-l1-tx"),
+                        abi_encoded: b"dummy-l1-tx".to_vec(),
+                    },
                 }],
                 storage: vec![],
                 block_hashes: vec![],
@@ -502,7 +501,8 @@ mod tests {
         for block in &batch_input.blocks {
             for (i, tx) in block.transactions.iter().enumerate() {
                 println!("  tx[{i}]: type=0x{:02x} caller={} force_fail={} gas_override={:?} is_l1={}",
-                    tx.tx_type, tx.caller, tx.force_fail, tx.gas_used_override, tx.is_l1_tx);
+                    tx.tx_type, tx.caller, tx.force_fail, tx.gas_used_override,
+                    matches!(tx.auth, TxAuth::L1 { .. }));
             }
         }
         println!(

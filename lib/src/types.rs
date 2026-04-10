@@ -95,6 +95,23 @@ pub struct BlockInput {
     pub expected_tree_root: B256,
 }
 
+/// Transaction authentication and hash binding.
+///
+/// Each variant carries the raw bytes whose hash is used in the block header
+/// rolling hash and the batch commitment. The executor verifies:
+/// - L1/Upgrade: `keccak256(abi_encoded) == tx_hash`, then checks ABI fields match TxInput
+/// - L2: `ecrecover(signed_bytes) == caller`
+#[derive(Serialize, Deserialize, Clone)]
+pub enum TxAuth {
+    /// L1 priority deposit. `abi_encoded` is the ABI-encoded L2CanonicalTransaction
+    /// whose `keccak256` equals `tx_hash`.
+    L1 { tx_hash: B256, abi_encoded: Vec<u8> },
+    /// Protocol upgrade transaction. Same ABI encoding as L1.
+    Upgrade { tx_hash: B256, abi_encoded: Vec<u8> },
+    /// L2 transaction. `signed_bytes` is EIP-2718 encoded; ecrecover verifies caller.
+    L2 { signed_bytes: Vec<u8> },
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct TxInput {
     pub caller: Address,
@@ -114,14 +131,8 @@ pub struct TxInput {
     pub force_fail: bool,
     pub mint: Option<U256>,
     pub refund_recipient: Option<Address>,
-    /// Is this an L1 priority transaction?
-    pub is_l1_tx: bool,
-    /// L1 tx hash for priority ops rolling hash.
-    pub l1_tx_hash: Option<B256>,
-    /// Raw RLP-encoded signed transaction bytes for signature verification.
-    /// If present, the guest verifies ecrecover(signature) == caller.
-    /// If absent, caller is trusted (only acceptable in unverified mode).
-    pub signed_tx_bytes: Option<Vec<u8>>,
+    /// Transaction authentication and hash binding.
+    pub auth: TxAuth,
 }
 
 /// L2->L1 log entry.

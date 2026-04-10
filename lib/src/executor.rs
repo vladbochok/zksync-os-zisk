@@ -302,23 +302,21 @@ pub fn execute_and_commit(input: &BatchInput) -> (BatchOutput, B256) {
 
     for block in &input.blocks {
         for tx in &block.transactions {
-            if tx.is_l1_tx {
-                if let Some(h) = &tx.l1_tx_hash {
-                    l1_tx_hashes.push(*h);
+            match &tx.auth {
+                TxAuth::L1 { tx_hash, .. } => {
+                    l1_tx_hashes.push(*tx_hash);
+                    num_l1_txs += 1;
                 }
-                num_l1_txs += 1;
-            } else if tx.tx_type == 0x7e {
-                // Upgrade txs: verify l1_tx_hash matches batch_meta.upgrade_tx_hash.
-                // Both are used in the commitment — they must be consistent.
-                if let Some(h) = &tx.l1_tx_hash {
+                TxAuth::Upgrade { tx_hash, .. } => {
                     assert_eq!(
-                        *h, meta.upgrade_tx_hash,
-                        "upgrade tx l1_tx_hash {h} != batch_meta.upgrade_tx_hash {}",
+                        *tx_hash, meta.upgrade_tx_hash,
+                        "upgrade tx hash {tx_hash} != batch_meta.upgrade_tx_hash {}",
                         meta.upgrade_tx_hash
                     );
                 }
-            } else {
-                num_l2_txs += 1;
+                TxAuth::L2 { .. } => {
+                    num_l2_txs += 1;
+                }
             }
         }
     }
@@ -424,11 +422,10 @@ pub fn execute_and_commit_debug(input: &BatchInput) -> (BatchOutput, B256, B256,
     let mut num_l2_txs: u64 = 0;
     for block in &input.blocks {
         for tx in &block.transactions {
-            if tx.is_l1_tx {
-                if let Some(h) = &tx.l1_tx_hash { l1_tx_hashes.push(*h); }
-                num_l1_txs += 1;
-            } else if tx.tx_type != 0x7e {
-                num_l2_txs += 1;
+            match &tx.auth {
+                TxAuth::L1 { tx_hash, .. } => { l1_tx_hashes.push(*tx_hash); num_l1_txs += 1; }
+                TxAuth::Upgrade { .. } => {}
+                TxAuth::L2 { .. } => { num_l2_txs += 1; }
             }
         }
     }
@@ -478,24 +475,10 @@ fn execute_block_proven(
     block: &BlockInput,
     cache_db: &mut CacheDB<ProvenDB>,
 ) -> (BlockResult, Vec<(Address, B256)>) {
-    let (tx_results, computed_l2_to_l1_logs, deployed_bytecodes) =
+    let (tx_results, tx_hashes, computed_l2_to_l1_logs, deployed_bytecodes) =
         run_evm_block(chain_id, spec_id, block, cache_db);
 
-    // Compute block header hash from execution results instead of trusting input.
-    // This ensures the block_header_hash used in state_after is derived from
-    // actual execution, not attacker-controlled input.
     let total_gas_used: u64 = tx_results.iter().map(|t| t.gas_used).sum();
-
-    // Compute transactions rolling hash using the same tx_hash logic as build_tx.
-    let tx_hashes: Vec<B256> = block.transactions.iter().map(|tx| {
-        if let Some(hash) = tx.l1_tx_hash {
-            hash
-        } else if let Some(ref signed) = tx.signed_tx_bytes {
-            alloy_primitives::keccak256(signed)
-        } else {
-            B256::ZERO
-        }
-    }).collect();
     let tx_root = commitment::transactions_rolling_hash(&tx_hashes);
 
 
@@ -685,98 +668,74 @@ fn build_proven_db(input: &BatchInput) -> ProvenDB {
     }
 }
 
-/// Build a transaction for proven execution.
-/// Verifies signatures for L2 txs, requires signed bytes for L1 txs.
-/// gas_used_override and force_fail are passed through from the server —
-/// they ensure the proven execution matches the server's execution exactly.
-fn build_proven_tx(input: &TxInput) -> ZKsyncTx<TxEnv> {
-    // Verify signed_tx_bytes are present and hash to the claimed tx_hash.
-    // This binds the tx data to its hash, preventing a malicious server from
-    // substituting tx fields (e.g. inflating L1 deposit mint amounts).
-    let signed_bytes = input.signed_tx_bytes.as_ref().unwrap_or_else(|| {
-        panic!(
-            "transaction from {} missing signed_tx_bytes — required for hash verification",
-            input.caller
-        )
-    });
+// L2CanonicalTransaction ABI layout (after the 32-byte outer offset word).
+// See zksync-era/contracts/l1-contracts/contracts/common/Messaging.sol
+mod abi_layout {
+    pub const OUTER_OFFSET: usize = 32;
+    pub const FROM: usize = 1;
+    pub const TO: usize = 2;
+    pub const VALUE: usize = 9;
+    pub const MINT: usize = 10;      // reserved[0]
+    pub const REFUND: usize = 11;    // reserved[1]
 
-    if input.is_l1_tx || input.tx_type == 0x7e {
-        // L1 priority and upgrade txs: signed_tx_bytes contains ABI-encoded
-        // L2CanonicalTransaction. Verify keccak256(abi_bytes) == l1_tx_hash,
-        // then verify the ABI-decoded fields match what TxInput tells REVM to execute.
-        let claimed_hash = input.l1_tx_hash.unwrap_or_else(|| {
-            panic!("L1/upgrade tx from {} missing l1_tx_hash", input.caller)
-        });
-        let computed_hash = alloy_primitives::keccak256(signed_bytes);
-        assert_eq!(
-            computed_hash, claimed_hash,
-            "L1 tx hash mismatch: keccak256(signed_tx_bytes)={computed_hash}, \
-             claimed l1_tx_hash={claimed_hash}"
-        );
-
-        // Decode the L2CanonicalTransaction ABI fields and verify they match TxInput.
-        // alloy's sol struct abi_encode() wraps in an outer offset word (32 bytes),
-        // so the actual struct fields start at byte 32.
-        // Layout from offset 32: 14 fixed U256 words (10 fields + 4 reserved),
-        // then dynamic offsets.
-        // Word offsets: 0=txType, 1=from, 2=to, 3=gasLimit, 4=gasPerPubdataByteLimit,
-        //   5=maxFeePerGas, 6=maxPriorityFeePerGas, 7=paymaster, 8=nonce, 9=value,
-        //   10-13=reserved[0..3]
-        let base = 32; // skip outer tuple offset
-        let word = |i: usize| -> U256 {
-            let off = base + i * 32;
-            U256::from_be_slice(&signed_bytes[off..off + 32])
-        };
-        let addr_from_word = |w: U256| -> Address {
-            Address::from_slice(&w.to_be_bytes::<32>()[12..])
-        };
-
-        let abi_value = word(9);
-        let abi_mint = word(10);            // reserved[0] = to_mint
-        let abi_refund = addr_from_word(word(11)); // reserved[1] = refund_recipient
-
-        // Verify execution-critical fields match the ABI-encoded data.
-        // For L1 priority txs, also verify caller/to/gas since they directly
-        // affect execution. For upgrade txs, caller may differ (L2 system addr
-        // vs L1 initiator), so we only verify value/mint/refund.
-        if input.is_l1_tx {
-            let abi_from = addr_from_word(word(1));
-            let abi_to = addr_from_word(word(2));
-            assert_eq!(abi_from, input.caller, "L1 tx: ABI 'from' != TxInput.caller");
-            if let Some(to) = input.to {
-                assert_eq!(abi_to, to, "L1 tx: ABI 'to' != TxInput.to");
-            }
-        }
-        assert_eq!(abi_value, input.value, "L1 tx: ABI value != TxInput.value");
-        if let Some(mint) = input.mint {
-            assert_eq!(abi_mint, mint, "L1 tx: ABI mint != TxInput.mint");
-        }
-        if let Some(refund) = input.refund_recipient {
-            assert_eq!(abi_refund, refund, "L1 tx: ABI refund_recipient != TxInput.refund_recipient");
-        }
-    } else {
-        // L2 txs: signed_tx_bytes contains EIP-2718 encoded signed tx.
-        // Verify ecrecover(signature) == caller.
-        let recovered_caller = recover_signer(signed_bytes);
-        assert_eq!(
-            recovered_caller, input.caller,
-            "signature verification failed: recovered {recovered_caller}, expected {}",
-            input.caller
-        );
+    pub fn word(abi: &[u8], field: usize) -> alloy_primitives::U256 {
+        let off = OUTER_OFFSET + field * 32;
+        alloy_primitives::U256::from_be_slice(&abi[off..off + 32])
     }
 
-    build_tx(input)
+    pub fn addr(abi: &[u8], field: usize) -> alloy_primitives::Address {
+        alloy_primitives::Address::from_slice(&word(abi, field).to_be_bytes::<32>()[12..])
+    }
 }
 
-fn build_tx(input: &TxInput) -> ZKsyncTx<TxEnv> {
-    let kind = match input.to {
-        Some(addr) => TxKind::Call(addr),
-        None => TxKind::Create,
+/// Verify the transaction's authenticity, compute its hash, and build
+/// the REVM transaction. Returns (ZKsyncTx, tx_hash).
+fn build_proven_tx(input: &TxInput) -> (ZKsyncTx<TxEnv>, B256) {
+    let tx_hash = match &input.auth {
+        TxAuth::L1 { tx_hash, abi_encoded } | TxAuth::Upgrade { tx_hash, abi_encoded } => {
+            // Verify keccak256(abi_encoded) == tx_hash.
+            let computed = alloy_primitives::keccak256(abi_encoded);
+            assert_eq!(computed, *tx_hash,
+                "tx hash mismatch: keccak256(abi)={computed}, claimed={tx_hash}");
+
+            // Verify execution-critical ABI fields match TxInput.
+            assert_eq!(abi_layout::word(abi_encoded, abi_layout::VALUE), input.value,
+                "ABI value != TxInput.value");
+            if let Some(mint) = input.mint {
+                assert_eq!(abi_layout::word(abi_encoded, abi_layout::MINT), mint,
+                    "ABI mint != TxInput.mint");
+            }
+            if let Some(refund) = input.refund_recipient {
+                assert_eq!(abi_layout::addr(abi_encoded, abi_layout::REFUND), refund,
+                    "ABI refund_recipient != TxInput.refund_recipient");
+            }
+            // For L1 priority txs, also verify caller/to (upgrade txs have
+            // different L2 caller vs L1 initiator).
+            if matches!(input.auth, TxAuth::L1 { .. }) {
+                assert_eq!(abi_layout::addr(abi_encoded, abi_layout::FROM), input.caller,
+                    "ABI from != TxInput.caller");
+                if let Some(to) = input.to {
+                    assert_eq!(abi_layout::addr(abi_encoded, abi_layout::TO), to,
+                        "ABI to != TxInput.to");
+                }
+            }
+            *tx_hash
+        }
+        TxAuth::L2 { signed_bytes } => {
+            let recovered = recover_signer(signed_bytes);
+            assert_eq!(recovered, input.caller,
+                "ecrecover: recovered {recovered}, expected {}", input.caller);
+            alloy_primitives::keccak256(signed_bytes)
+        }
     };
 
-    // For upgrade transactions (0x7e), use unlimited gas since EVM gas metering
-    // differs from ZKsync OS native gas. The actual gas is handled by gas_used_override.
-    let effective_gas_limit = if input.tx_type == 0x7e {
+    let revm_kind = match input.to {
+        Some(addr) => revm::primitives::TxKind::Call(addr),
+        None => revm::primitives::TxKind::Create,
+    };
+
+    // Upgrade txs get extra gas headroom (EVM gas >> native gas).
+    let gas_limit = if input.tx_type == 0x7e {
         input.gas_limit.saturating_mul(10)
     } else {
         input.gas_limit
@@ -784,9 +743,9 @@ fn build_tx(input: &TxInput) -> ZKsyncTx<TxEnv> {
 
     let mut builder = TxEnv::builder()
         .caller(input.caller)
-        .gas_limit(effective_gas_limit)
+        .gas_limit(gas_limit)
         .gas_price(input.gas_price)
-        .kind(kind)
+        .kind(revm_kind)
         .value(input.value)
         .data(Bytes::copy_from_slice(&input.data))
         .nonce(input.nonce)
@@ -798,19 +757,7 @@ fn build_tx(input: &TxInput) -> ZKsyncTx<TxEnv> {
         builder = builder.gas_priority_fee(Some(fee));
     }
 
-    // Compute the trusted tx_hash:
-    // - L1 priority txs: use l1_tx_hash (canonical priority queue hash)
-    // - L2 txs: keccak256 of EIP-2718 encoded signed bytes
-    // - Fallback: B256::ZERO (e.g. upgrade txs with l1_tx_hash set by server)
-    let tx_hash = if let Some(hash) = input.l1_tx_hash {
-        hash
-    } else if let Some(ref signed) = input.signed_tx_bytes {
-        alloy_primitives::keccak256(signed)
-    } else {
-        B256::ZERO
-    };
-
-    ZKsyncTxBuilder::new()
+    let tx = ZKsyncTxBuilder::new()
         .base(builder)
         .mint(input.mint.unwrap_or_default())
         .refund_recipient(input.refund_recipient)
@@ -818,7 +765,9 @@ fn build_tx(input: &TxInput) -> ZKsyncTx<TxEnv> {
         .force_fail(input.force_fail)
         .tx_hash(tx_hash)
         .build()
-        .expect("failed to build ZKsyncTx")
+        .expect("failed to build ZKsyncTx");
+
+    (tx, tx_hash)
 }
 
 /// Recover the signer address from EIP-2718 encoded signed transaction bytes.
@@ -852,7 +801,7 @@ fn run_evm_block<DB: DatabaseRef>(
     spec_id: ZkSpecId,
     block: &BlockInput,
     cache_db: &mut CacheDB<DB>,
-) -> (Vec<TxOutput>, Vec<L2ToL1LogEntry>, Vec<(Address, B256)>)
+) -> (Vec<TxOutput>, Vec<B256>, Vec<L2ToL1LogEntry>, Vec<(Address, B256)>)
 where
     DB::Error: core::fmt::Debug,
 {
@@ -873,20 +822,19 @@ where
         .build_zk();
 
     let mut tx_results = Vec::with_capacity(block.transactions.len());
-    let mut computed_l2_to_l1_logs = Vec::new();
+    let mut tx_hashes = Vec::with_capacity(block.transactions.len());
+    let mut l2_to_l1_logs = Vec::new();
 
     for (tx_idx, tx_input) in block.transactions.iter().enumerate() {
-        let tx_number = tx_idx as u16;
-        evm.0.ctx.chain.set_tx_number(tx_number);
+        evm.0.ctx.chain.set_tx_number(tx_idx as u16);
 
-        let tx = build_proven_tx(tx_input);
+        let (tx, tx_hash) = build_proven_tx(tx_input);
+        tx_hashes.push(tx_hash);
+
         match evm.transact_commit(tx) {
             Ok(result) => {
-                // L1 tx result log is emitted automatically by the handler's
-                // post_execution when l1_tx_hash is set on the transaction.
-
                 for log in evm.0.ctx.chain.take_logs() {
-                    computed_l2_to_l1_logs.push(L2ToL1LogEntry {
+                    l2_to_l1_logs.push(L2ToL1LogEntry {
                         l2_shard_id: log.l2_shard_id,
                         is_service: log.is_service,
                         tx_number_in_block: log.tx_number_in_block,
@@ -895,7 +843,6 @@ where
                         value: log.value,
                     });
                 }
-
                 tx_results.push(TxOutput {
                     success: result.is_success(),
                     gas_used: result.gas_used(),
@@ -906,10 +853,9 @@ where
         }
     }
 
-    // Extract deployed bytecode hashes before dropping the EVM.
     let deployed_bytecodes = core::mem::take(&mut evm.0.ctx.chain.deployed_bytecode_hashes);
 
-    (tx_results, computed_l2_to_l1_logs, deployed_bytecodes)
+    (tx_results, tx_hashes, l2_to_l1_logs, deployed_bytecodes)
 }
 
 /// Collect storage and account diffs from the CacheDB after all blocks have executed.
