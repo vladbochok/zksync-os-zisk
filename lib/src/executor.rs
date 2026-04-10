@@ -759,6 +759,7 @@ fn build_tx(input: &TxInput) -> ZKsyncTx<TxEnv> {
         .refund_recipient(input.refund_recipient)
         .gas_used_override(input.gas_used_override)
         .force_fail(input.force_fail)
+        .l1_tx_hash(input.l1_tx_hash)
         .build()
         .expect("failed to build ZKsyncTx")
 }
@@ -934,17 +935,8 @@ where
                 let success = result.is_success();
 
                 // For L1→L2 transactions (both priority and upgrade), emit the
-                // bootloader result log. In zksync-os, process_l1_transaction
-                // calls emit_l1_l2_tx_log for both is_priority_op=true and false.
-                let bootloader_log_hash = if tx_input.is_l1_tx {
-                    tx_input.l1_tx_hash
-                } else if tx_input.tx_type == 0x7e {
-                    let h = batch_meta.upgrade_tx_hash;
-                    if h.is_zero() { None } else { Some(h) }
-                } else {
-                    None
-                };
-                if let Some(tx_hash) = bootloader_log_hash {
+                // bootloader result log.
+                if let Some(tx_hash) = tx_input.l1_tx_hash {
                     evm.0.ctx.chain.emit_l1_tx_result(tx_hash, success);
                 }
 
