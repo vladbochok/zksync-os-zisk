@@ -193,7 +193,6 @@ mod tests {
                     refund_recipient: Some(sender),
                     auth: TxAuth::L1 { tx_hash: l1_tx_hash, abi_encoded: l1_abi.clone() },
                 }],
-                storage: vec![],
                 block_hashes: vec![],
                 l2_to_l1_logs: vec![L2ToL1LogEntry {
                     l2_shard_id: 0,
@@ -299,7 +298,6 @@ mod tests {
                         abi_encoded: b"dummy-l1-tx".to_vec(),
                     },
                 }],
-                storage: vec![],
                 block_hashes: vec![],
                 l2_to_l1_logs: vec![],
                 expected_tree_root: B256::ZERO,
@@ -387,7 +385,6 @@ mod tests {
                 storage_proofs: vec![(sender_flat_key, proof)],
                 account_preimages: vec![(sender, fake_props)], // FAKE
                 transactions: vec![],
-                storage: vec![],
                 block_hashes: vec![],
                 l2_to_l1_logs: vec![],
                 expected_tree_root: B256::ZERO,
@@ -440,16 +437,6 @@ mod tests {
             println!("  inserts: {inserts}, updates: {updates}");
 
             // Check storage for proxy implementation slot
-            let proxy_impl_slot = "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc";
-            let proxy_addr: alloy_primitives::Address = "0x000000000000000000000000000000000000800f".parse().unwrap();
-            let found_storage = batch.blocks[0].storage.iter()
-                .find(|(a, s, _)| *a == proxy_addr);
-            println!("  0x800f proxy storage entries: {}",
-                batch.blocks[0].storage.iter().filter(|(a, _, _)| *a == proxy_addr).count());
-            if let Some((_, slot, val)) = found_storage {
-                println!("    slot={}, val={}", slot, val);
-            }
-
             // Run proven executor and compare writes
             let result = std::panic::catch_unwind(|| {
                 executor::execute_and_commit(&batch)

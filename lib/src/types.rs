@@ -74,8 +74,6 @@ pub struct BlockInput {
     /// Keyed by address. Used to decode nonce/balance/code_hash from the
     /// merkle-verified value at (0x8003, left_padded_address).
     pub account_preimages: Vec<(Address, Vec<u8>)>,
-    /// Pre-state storage slots.
-    pub storage: Vec<(Address, U256, U256)>,
     /// Block hashes for BLOCKHASH opcode.
     pub block_hashes: Vec<(u64, B256)>,
     /// Merkle proofs for every storage slot accessed. Key = flat_storage_key.

@@ -119,6 +119,17 @@ impl DatabaseRef for ProvenDB {
 /// Execute a batch with full merkle proof verification and compute the
 /// BatchPublicInput hash matching the server/L1 format.
 pub fn execute_and_commit(input: &BatchInput) -> (BatchOutput, B256) {
+    let (output, commitment, _, _, _) = execute_and_commit_inner(input);
+    (output, commitment)
+}
+
+/// Same as `execute_and_commit` but also returns the three commitment
+/// sub-components for debugging.
+pub fn execute_and_commit_debug(input: &BatchInput) -> (BatchOutput, B256, B256, B256, B256) {
+    execute_and_commit_inner(input)
+}
+
+fn execute_and_commit_inner(input: &BatchInput) -> (BatchOutput, B256, B256, B256, B256) {
     let spec_id = match input.spec_id {
         0 => ZkSpecId::AtlasV1,
         1 => ZkSpecId::AtlasV2,
@@ -205,7 +216,7 @@ pub fn execute_and_commit(input: &BatchInput) -> (BatchOutput, B256) {
     );
 
     // Collect batch-level diffs from the CacheDB (comparing final state vs proven pre-state).
-    let (storage_diffs, account_diffs) = collect_batch_diffs(&cache_db, input);
+    let (storage_diffs, account_diffs) = collect_batch_diffs(&cache_db);
 
     // State after: compute new tree root by applying storage writes.
     // SOUND-3: verify tree update entries match what REVM actually computed.
@@ -374,95 +385,6 @@ pub fn execute_and_commit(input: &BatchInput) -> (BatchOutput, B256) {
         )
     };
 
-    let commitment = commitment::batch_public_input_hash(&state_before, &state_after, &batch_hash);
-    (output, commitment)
-}
-
-/// Debug: return the three commitment components alongside the final hash.
-/// Returns (output, commitment, state_before, state_after, batch_hash).
-pub fn execute_and_commit_debug(input: &BatchInput) -> (BatchOutput, B256, B256, B256, B256) {
-    // Re-use execute_and_commit internals by running the same logic
-    // and extracting intermediate values.
-    let (output, _) = execute_and_commit(input);
-
-    // Re-derive the commitment components from the output + input.
-    let meta = &input.batch_meta;
-    let state_before = commitment::state_commitment_hash(
-        &meta.tree_root_before,
-        meta.leaf_count_before,
-        meta.block_number_before,
-        &meta.block_hashes_blake_before,
-        meta.last_block_timestamp_before,
-    );
-
-    let last_block = input.blocks.last().unwrap();
-    let last_br = output.block_results.last().unwrap();
-
-    let (tree_root_after, new_leaf_count) = if let Some(ref tree_update) = meta.tree_update {
-        tree_update.apply(&meta.tree_root_before)
-    } else {
-        (meta.tree_root_before, meta.leaf_count_before)
-    };
-
-    let block_hashes_blake_after = commitment::block_hashes_blake(
-        &meta.previous_block_hashes,
-        &last_br.computed_block_header_hash,
-    );
-    let state_after = commitment::state_commitment_hash(
-        &tree_root_after,
-        new_leaf_count,
-        last_block.number,
-        &block_hashes_blake_after,
-        last_block.timestamp,
-    );
-
-    let mut l1_tx_hashes = Vec::new();
-    let mut l2_to_l1_encoded_logs = Vec::new();
-    let mut num_l1_txs: u64 = 0;
-    let mut num_l2_txs: u64 = 0;
-    for block in &input.blocks {
-        for tx in &block.transactions {
-            match &tx.auth {
-                TxAuth::L1 { tx_hash, .. } => { l1_tx_hashes.push(*tx_hash); num_l1_txs += 1; }
-                TxAuth::Upgrade { .. } => {}
-                TxAuth::L2 { .. } => { num_l2_txs += 1; }
-            }
-        }
-    }
-    for br in &output.block_results {
-        for log in &br.l2_to_l1_logs {
-            l2_to_l1_encoded_logs.push(log.encode());
-        }
-    }
-    let priority_ops_hash = commitment::priority_ops_rolling_hash(&l1_tx_hashes);
-    let l2_logs_local_root = commitment::l2_to_l1_logs_root(&l2_to_l1_encoded_logs);
-    let effective_multichain_root = if input.protocol_version_minor >= 31 {
-        meta.multichain_root
-    } else {
-        B256::ZERO
-    };
-    let l2_logs_root_hash = commitment::keccak_two(&l2_logs_local_root, &effective_multichain_root);
-    let da_commitment = match meta.da_commitment_scheme {
-        0 | 1 => B256::ZERO,
-        2 | 3 => commitment::da_commitment_calldata(&meta.pubdata),
-        4 => commitment::da_commitment_blobs(&meta.blob_versioned_hashes),
-        _ => panic!("unsupported DA scheme"),
-    };
-    let batch_hash = if input.protocol_version_minor >= 31 {
-        commitment::batch_output_hash_v31(
-            input.chain_id, input.blocks.first().unwrap().timestamp,
-            last_block.timestamp, meta.da_commitment_scheme, &da_commitment,
-            num_l1_txs, num_l2_txs, &priority_ops_hash, &l2_logs_root_hash,
-            &meta.upgrade_tx_hash, &B256::ZERO, meta.sl_chain_id,
-        )
-    } else {
-        commitment::batch_output_hash_v30(
-            input.chain_id, input.blocks.first().unwrap().timestamp,
-            last_block.timestamp, meta.da_commitment_scheme, &da_commitment,
-            num_l1_txs, &priority_ops_hash, &l2_logs_root_hash,
-            &meta.upgrade_tx_hash, &B256::ZERO,
-        )
-    };
     let commitment = commitment::batch_public_input_hash(&state_before, &state_after, &batch_hash);
     (output, commitment, state_before, state_after, batch_hash)
 }
@@ -859,22 +781,12 @@ where
 }
 
 /// Collect storage and account diffs from the CacheDB after all blocks have executed.
-/// Compares the CacheDB's final state against the proven pre-state from all blocks.
-fn collect_batch_diffs(
-    cache_db: &CacheDB<ProvenDB>,
-    input: &BatchInput,
-) -> (Vec<StorageDiff>, Vec<AccountDiff>) {
-    // Build batch-level lookup maps for "before" values from all blocks' pre-state.
-    let mut storage_map: HashMap<(Address, U256), U256> = HashMap::new();
-    for block in &input.blocks {
-        for &(a, s, v) in &block.storage {
-            storage_map.entry((a, s)).or_insert(v);
-        }
-    }
-
+/// Compares the CacheDB's final state against the merkle-verified pre-state.
+fn collect_batch_diffs(cache_db: &CacheDB<ProvenDB>) -> (Vec<StorageDiff>, Vec<AccountDiff>) {
     let proven_db = &cache_db.db;
     let mut storage_diffs = Vec::new();
     let mut account_diffs = Vec::new();
+
     for (addr, db_account) in cache_db.cache.accounts.iter() {
         if matches!(
             db_account.account_state,
@@ -884,7 +796,6 @@ fn collect_batch_diffs(
         }
         let info = &db_account.info;
         // Before-values from merkle-verified accounts.
-        // Non-existent accounts have before = (0, 0).
         let (nonce_before, balance_before) = proven_db.verified_accounts
             .get(addr)
             .and_then(|opt| opt.as_ref())
@@ -900,11 +811,16 @@ fn collect_batch_diffs(
                 balance_after: info.balance,
             });
         }
+        // Before-values from merkle-verified storage.
         for (slot, value) in db_account.storage.iter() {
             let slot_u256 = U256::from_limbs((*slot).into_limbs());
-            let old_val = storage_map
-                .get(&(*addr, slot_u256))
-                .copied()
+            let addr_bytes: [u8; 20] = addr.into_array();
+            let slot_b256 = B256::from(slot_u256.to_be_bytes::<32>());
+            let flat_key = merkle::derive_flat_storage_key(&addr_bytes, &slot_b256);
+            let old_val = proven_db.verified_storage
+                .get(&flat_key)
+                .and_then(|v| *v)
+                .map(|v| U256::from_be_bytes(v.0))
                 .unwrap_or(U256::ZERO);
             let new_val = U256::from_limbs((*value).into_limbs());
             if old_val != new_val {
