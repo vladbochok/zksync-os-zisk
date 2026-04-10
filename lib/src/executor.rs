@@ -675,39 +675,32 @@ fn build_proven_db(input: &BatchInput) -> ProvenDB {
 /// gas_used_override and force_fail are passed through from the server —
 /// they ensure the proven execution matches the server's execution exactly.
 fn build_proven_tx(input: &TxInput) -> ZKsyncTx<TxEnv> {
-    if input.is_l1_tx {
-        // L1 priority transactions: verify that the encoded tx bytes hash to
-        // the claimed l1_tx_hash. Both fields are required — without them an
-        // attacker could use a real l1_tx_hash while substituting tx fields
-        // (e.g., inflating mint amount).
-        let _signed_bytes = input.signed_tx_bytes.as_ref().unwrap_or_else(|| {
-            panic!(
-                "L1 transaction from {} missing signed_tx_bytes — \
-                 every L1 tx must include encoded bytes for hash verification",
-                input.caller
-            )
+    // Verify signed_tx_bytes are present and hash to the claimed tx_hash.
+    // This binds the tx data to its hash, preventing a malicious server from
+    // substituting tx fields (e.g. inflating L1 deposit mint amounts).
+    let signed_bytes = input.signed_tx_bytes.as_ref().unwrap_or_else(|| {
+        panic!(
+            "transaction from {} missing signed_tx_bytes — required for hash verification",
+            input.caller
+        )
+    });
+
+    if input.is_l1_tx || input.tx_type == 0x7e {
+        // L1 priority and upgrade txs: signed_tx_bytes contains ABI-encoded
+        // L2CanonicalTransaction. Verify keccak256(abi_bytes) == l1_tx_hash.
+        let claimed_hash = input.l1_tx_hash.unwrap_or_else(|| {
+            panic!("L1/upgrade tx from {} missing l1_tx_hash", input.caller)
         });
-        let _claimed_hash = input.l1_tx_hash.unwrap_or_else(|| {
-            panic!(
-                "L1 transaction from {} missing l1_tx_hash — \
-                 every L1 tx must include its canonical hash",
-                input.caller
-            )
-        });
-        // L1 tx hashes are canonical priority queue hashes, not keccak256(raw_bytes).
-        // They are verified via priority_operations_rolling_hash in the batch commitment,
-        // not via raw hash comparison here.
-    } else if input.tx_type == 0x7e {
-        // Upgrade txs don't have signed bytes — they're system txs verified by the L1 protocol.
+        let computed_hash = alloy_primitives::keccak256(signed_bytes);
+        assert_eq!(
+            computed_hash, claimed_hash,
+            "L1 tx hash mismatch: keccak256(signed_tx_bytes)={computed_hash}, \
+             claimed l1_tx_hash={claimed_hash}. The signed_tx_bytes must be the \
+             ABI-encoded L2CanonicalTransaction whose hash matches l1_tx_hash."
+        );
     } else {
-        // L2 transactions MUST have signed_tx_bytes for signature verification.
-        let signed_bytes = input.signed_tx_bytes.as_ref().unwrap_or_else(|| {
-            panic!(
-                "L2 transaction from {} missing signed_tx_bytes — \
-                 every L2 tx must include signed bytes for ecrecover",
-                input.caller
-            )
-        });
+        // L2 txs: signed_tx_bytes contains EIP-2718 encoded signed tx.
+        // Verify ecrecover(signature) == caller.
         let recovered_caller = recover_signer(signed_bytes);
         assert_eq!(
             recovered_caller, input.caller,
