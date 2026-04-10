@@ -35,9 +35,6 @@ struct ProvenDB {
     /// Merkle-verified account info. Every entry was proven against the tree
     /// root at construction time. None = proven non-existent.
     verified_accounts: HashMap<Address, Option<AccountInfo>>,
-    /// Raw 124-byte account property preimages. Used after execution to
-    /// reconstruct 0x8003 values for changed accounts by patching fields.
-    raw_account_preimages: HashMap<Address, Vec<u8>>,
     /// Verified bytecodes keyed by hash (keccak256 or blake2s).
     bytecodes: HashMap<B256, Bytecode>,
     /// Block hashes for BLOCKHASH opcode (verified against batch_meta).
@@ -147,16 +144,14 @@ fn execute_and_commit_inner(input: &BatchInput) -> (BatchOutput, B256, B256, B25
     let mut cache_db = CacheDB::new(proven_db);
 
     let mut block_results = Vec::with_capacity(input.blocks.len());
-    let mut all_deployed_bytecodes: Vec<(Address, B256)> = Vec::new();
     let mut computed_block_hashes: HashMap<u64, B256> = HashMap::new();
 
     for block in &input.blocks {
         verify_intra_batch_hashes(block, &computed_block_hashes);
 
-        let (result, deployed_bytecodes) = execute_block_proven(
+        let result = execute_block_proven(
             input.chain_id, spec_id, block, &mut cache_db,
         );
-        all_deployed_bytecodes.extend(deployed_bytecodes);
         computed_block_hashes.insert(block.number, result.computed_block_header_hash);
         block_results.push(result);
     }
@@ -164,7 +159,7 @@ fn execute_and_commit_inner(input: &BatchInput) -> (BatchOutput, B256, B256, B25
     let output = BatchOutput { chain_id: input.chain_id, block_results };
 
     // Build complete write map (storage + 0x8003 account properties) and verify.
-    let revm_writes = build_revm_write_map(&cache_db, &all_deployed_bytecodes);
+    let revm_writes = build_revm_write_map(&cache_db, &meta.account_preimages_after);
     let (tree_root_after, new_leaf_count) = verify_tree_update(meta, &revm_writes);
 
     // State before.
@@ -277,8 +272,8 @@ fn execute_block_proven(
     spec_id: ZkSpecId,
     block: &BlockInput,
     cache_db: &mut CacheDB<ProvenDB>,
-) -> (BlockResult, Vec<(Address, B256)>) {
-    let (tx_results, tx_hashes, computed_l2_to_l1_logs, deployed_bytecodes) =
+) -> BlockResult {
+    let (tx_results, tx_hashes, computed_l2_to_l1_logs) =
         run_evm_block(chain_id, spec_id, block, cache_db);
 
     let total_gas_used: u64 = tx_results.iter().map(|t| t.gas_used).sum();
@@ -342,12 +337,12 @@ fn execute_block_proven(
         }
     }
 
-    (BlockResult {
+    BlockResult {
         block_number: block.number,
         computed_block_header_hash: computed_header_hash,
         tx_results,
         l2_to_l1_logs: computed_l2_to_l1_logs,
-    }, deployed_bytecodes)
+    }
 }
 
 /// Build a ProvenDB for the entire batch.
@@ -358,7 +353,6 @@ fn build_proven_db(input: &BatchInput) -> ProvenDB {
     let meta = &input.batch_meta;
     let mut verified_storage: HashMap<B256, Option<B256>> = HashMap::new();
     let mut verified_accounts: HashMap<Address, Option<AccountInfo>> = HashMap::new();
-    let mut raw_account_preimages: HashMap<Address, Vec<u8>> = HashMap::new();
     let mut bytecodes: HashMap<B256, Bytecode> = HashMap::new();
     let mut block_hashes: HashMap<u64, B256> = HashMap::new();
 
@@ -437,7 +431,6 @@ fn build_proven_db(input: &BatchInput) -> ProvenDB {
                         code,
                         account_id: None,
                     }));
-                    raw_account_preimages.insert(*addr, preimage.clone());
                 }
             }
         }
@@ -468,7 +461,6 @@ fn build_proven_db(input: &BatchInput) -> ProvenDB {
     ProvenDB {
         verified_storage,
         verified_accounts,
-        raw_account_preimages,
         bytecodes,
         block_hashes,
     }
@@ -607,7 +599,7 @@ fn run_evm_block<DB: DatabaseRef>(
     spec_id: ZkSpecId,
     block: &BlockInput,
     cache_db: &mut CacheDB<DB>,
-) -> (Vec<TxOutput>, Vec<B256>, Vec<L2ToL1LogEntry>, Vec<(Address, B256)>)
+) -> (Vec<TxOutput>, Vec<B256>, Vec<L2ToL1LogEntry>)
 where
     DB::Error: core::fmt::Debug,
 {
@@ -659,21 +651,20 @@ where
         }
     }
 
-    let deployed_bytecodes = core::mem::take(&mut evm.0.ctx.chain.deployed_bytecode_hashes);
-
-    (tx_results, tx_hashes, l2_to_l1_logs, deployed_bytecodes)
+    (tx_results, tx_hashes, l2_to_l1_logs)
 }
 
 /// Build the complete write map: flat_key → new_value for both regular storage
-/// writes and 0x8003 account-property writes. This is compared against
-/// tree_update with no exceptions — every write is verified.
+/// writes and 0x8003 account-property writes. For 0x8003, the server provides
+/// after-state preimages; we verify nonce/balance match REVM output, then use
+/// blake2s(preimage) as the value.
 fn build_revm_write_map(
     cache_db: &CacheDB<ProvenDB>,
-    deployed_bytecodes: &[(Address, B256)],
+    after_preimages: &[(Address, Vec<u8>)],
 ) -> HashMap<B256, B256> {
     let proven_db = &cache_db.db;
-    let deployed_map: HashMap<&Address, &B256> = deployed_bytecodes.iter()
-        .map(|(a, h)| (a, h)).collect();
+    let after_map: HashMap<&Address, &Vec<u8>> = after_preimages.iter()
+        .map(|(a, p)| (a, p)).collect();
 
     let mut writes = HashMap::new();
 
@@ -702,54 +693,20 @@ fn build_revm_write_map(
             }
         }
 
-        // 0x8003 account-property write if account state changed.
-        let info = &db_account.info;
-        let old_account = proven_db.verified_accounts.get(addr)
-            .and_then(|opt| opt.as_ref());
-        let (old_nonce, old_balance, old_code_hash) = old_account
-            .map(|ai| (ai.nonce, ai.balance, ai.code_hash))
-            .unwrap_or((0, U256::ZERO, B256::ZERO));
+        // 0x8003 account-property write: use server-provided after-preimage.
+        if let Some(after_preimage) = after_map.get(addr) {
+            let props = merkle::AccountProperties::decode(after_preimage);
+            let info = &db_account.info;
 
-        let nonce_changed = info.nonce != old_nonce;
-        let balance_changed = info.balance != old_balance;
-        let code_changed = info.code_hash != old_code_hash
-            && info.code_hash != KECCAK_EMPTY
-            && !info.code_hash.is_zero();
+            // Verify nonce and balance match REVM's execution.
+            assert_eq!(props.nonce, info.nonce,
+                "after-preimage nonce mismatch for {addr}: preimage={}, revm={}",
+                props.nonce, info.nonce);
+            assert_eq!(U256::from_be_bytes(props.balance), info.balance,
+                "after-preimage balance mismatch for {addr}");
 
-        if nonce_changed || balance_changed || code_changed {
-            let balance_bytes = info.balance.to_be_bytes::<32>();
             let flat_key = merkle::derive_account_properties_key(&addr_bytes);
-
-            let new_value_hash = if let Some(raw_preimage) = proven_db.raw_account_preimages.get(addr) {
-                // Existing account — patch the raw preimage.
-                if code_changed {
-                    // Code changed: need blake2s hash from deployer precompile.
-                    let blake2s = deployed_map.get(addr).unwrap_or_else(|| {
-                        panic!("account {addr} code changed but no deployed bytecode hash recorded")
-                    });
-                    let code_len = info.code.as_ref().map(|c| c.len() as u32).unwrap_or(0);
-                    merkle::AccountProperties::patch_full(
-                        raw_preimage, info.nonce, &balance_bytes,
-                        blake2s, code_len, &info.code_hash,
-                    )
-                } else {
-                    // Only nonce/balance changed — patch those fields.
-                    merkle::AccountProperties::patch_nonce_balance(
-                        raw_preimage, info.nonce, &balance_bytes,
-                    )
-                }
-            } else {
-                // New account (no prior preimage).
-                let blake2s = deployed_map.get(addr).copied().cloned()
-                    .unwrap_or(B256::ZERO);
-                let code_len = info.code.as_ref().map(|c| c.len() as u32).unwrap_or(0);
-                merkle::AccountProperties::encode_new(
-                    info.nonce, &balance_bytes,
-                    &blake2s, code_len, &info.code_hash,
-                )
-            };
-
-            writes.insert(flat_key, new_value_hash);
+            writes.insert(flat_key, merkle::AccountProperties::hash(after_preimage));
         }
     }
 

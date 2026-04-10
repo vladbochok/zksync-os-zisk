@@ -160,6 +160,7 @@ mod tests {
                 multichain_root: B256::ZERO,
                 sl_chain_id: 0, blob_versioned_hashes: vec![],
                 tree_update: None,
+                account_preimages_after: vec![],
             },
             blocks: vec![BlockInput {
                 number: 1,
@@ -267,6 +268,7 @@ mod tests {
                 multichain_root: B256::ZERO,
                 sl_chain_id: 0, blob_versioned_hashes: vec![],
                 tree_update: None,
+                account_preimages_after: vec![],
             },
             blocks: vec![BlockInput {
                 number: 1,
@@ -373,6 +375,7 @@ mod tests {
                 multichain_root: B256::ZERO,
                 sl_chain_id: 0, blob_versioned_hashes: vec![],
                 tree_update: None,
+                account_preimages_after: vec![],
             },
             blocks: vec![BlockInput {
                 number: 1,

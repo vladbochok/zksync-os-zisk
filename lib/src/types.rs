@@ -58,6 +58,12 @@ pub struct BatchMeta {
     /// Contains old leaves, intermediate hashes, and write operations.
     /// If None, state_after root = state_before root (no writes — incomplete).
     pub tree_update: Option<BatchTreeUpdate>,
+    /// After-state account property preimages (124 bytes each).
+    /// For each account whose 0x8003 value changed, the server provides the
+    /// full after-state preimage. The executor verifies nonce/balance match
+    /// REVM's output, then checks blake2s(preimage) == tree_update value.
+    #[serde(default)]
+    pub account_preimages_after: Vec<(Address, Vec<u8>)>,
 }
 
 /// Single block input with pre-state and transactions.
