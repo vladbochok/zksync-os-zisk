@@ -492,7 +492,7 @@ fn build_proven_tx(input: &TxInput) -> (ZKsyncTx<TxEnv>, B256) {
     let tx_hash = match &input.auth {
         TxAuth::L1 { tx_hash, abi_encoded } | TxAuth::Upgrade { tx_hash, abi_encoded } => {
             // Verify keccak256(abi_encoded) == tx_hash.
-            let computed = alloy_primitives::keccak256(abi_encoded);
+            let computed = crate::hash::keccak256(abi_encoded);
             assert_eq!(computed, *tx_hash,
                 "tx hash mismatch: keccak256(abi)={computed}, claimed={tx_hash}");
 
@@ -523,7 +523,7 @@ fn build_proven_tx(input: &TxInput) -> (ZKsyncTx<TxEnv>, B256) {
             let recovered = recover_signer(signed_bytes);
             assert_eq!(recovered, input.caller,
                 "ecrecover: recovered {recovered}, expected {}", input.caller);
-            alloy_primitives::keccak256(signed_bytes)
+            crate::hash::keccak256(signed_bytes)
         }
     };
 

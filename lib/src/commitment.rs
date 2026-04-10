@@ -5,18 +5,8 @@ use alloy_primitives::B256;
 use blake2::digest::FixedOutput;
 use blake2::{Blake2s256, Digest};
 
-// ---------------------------------------------------------------------------
-// Keccak256 helpers
-// ---------------------------------------------------------------------------
-
-pub(crate) fn keccak256(data: &[u8]) -> B256 {
-    use tiny_keccak::{Hasher, Keccak};
-    let mut k = Keccak::v256();
-    k.update(data);
-    let mut out = [0u8; 32];
-    k.finalize(&mut out);
-    B256::from(out)
-}
+// Re-export the accelerated keccak256.
+pub(crate) use crate::hash::keccak256;
 
 fn keccak_compress(lhs: &B256, rhs: &B256) -> B256 {
     let mut data = [0u8; 64];
