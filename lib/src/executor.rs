@@ -149,6 +149,7 @@ pub fn execute_and_commit(input: &BatchInput) -> (BatchOutput, B256) {
     let mut cache_db = CacheDB::new(proven_db);
 
     let mut block_results = Vec::with_capacity(input.blocks.len());
+    let mut all_deployed_bytecodes: Vec<(Address, B256)> = Vec::new();
     // Track computed block header hashes to cross-verify intra-batch BLOCKHASH usage.
     let mut computed_block_hashes: HashMap<u64, B256> = HashMap::new();
     for block in &input.blocks {
@@ -164,13 +165,14 @@ pub fn execute_and_commit(input: &BatchInput) -> (BatchOutput, B256) {
             }
         }
 
-        let result = execute_block_proven(
+        let (result, deployed_bytecodes) = execute_block_proven(
             input.chain_id,
             spec_id,
             block,
             meta,
             &mut cache_db,
         );
+        all_deployed_bytecodes.extend(deployed_bytecodes);
 
         // Record the computed block header hash for subsequent blocks' BLOCKHASH verification
         computed_block_hashes.insert(block.number, result.computed_block_header_hash);
@@ -232,30 +234,31 @@ pub fn execute_and_commit(input: &BatchInput) -> (BatchOutput, B256) {
             );
         }
 
-        // Reverse check: every tree_update entry must be in REVM writes OR
-        // be an 0x8003 account-property write.
-        //
-        // 0x8003 entries include bytecode_hash (ZKsync blake2s) which REVM
-        // cannot compute. These extra entries are constrained by:
-        // (a) The batch-level tree_update old root is independently verified
-        // (b) The new root is independently computed from verified old hashes
-        // (c) The forward check ensures all REVM writes ARE in the tree
-        //
-        // Log extra entries (entries in tree_update but not in REVM writes).
-        // These are 0x8003 account-property writes that the server tracks
-        // but REVM doesn't. Soundness comes from:
-        // (a) Forward check: every REVM write IS in tree_update
-        // (b) Old root verified against batch_meta.tree_root_before
-        // (c) New root independently computed from verified old hashes + writes
+        // SOUND-3 reverse check: every extra tree_update entry (not in REVM
+        // writes) must be a legitimate 0x8003 account-property write.
+        // Build the set of expected 0x8003 flat_keys from accounts that
+        // changed state (nonce/balance) or had bytecode deployed.
         {
-            let extra_count = tree_write_map.keys()
-                .filter(|k| !revm_write_map.contains_key(*k))
-                .count();
-            if extra_count > 0 {
-                eprintln!(
-                    "tree_update has {extra_count} entries not in REVM writes \
-                     (expected: account-property writes at 0x8003)"
-                );
+            let mut expected_account_keys: std::collections::HashSet<B256> = std::collections::HashSet::new();
+            // Accounts with nonce/balance changes
+            for diff in &_account_diffs {
+                let addr_bytes: [u8; 20] = diff.address.into_array();
+                expected_account_keys.insert(merkle::derive_account_properties_key(&addr_bytes));
+            }
+            // Accounts with bytecode deployments (from deployer precompile)
+            for (addr, _blake2s_hash) in &all_deployed_bytecodes {
+                let addr_bytes: [u8; 20] = addr.into_array();
+                expected_account_keys.insert(merkle::derive_account_properties_key(&addr_bytes));
+            }
+
+            for tree_key in tree_write_map.keys() {
+                if !revm_write_map.contains_key(tree_key) {
+                    assert!(
+                        expected_account_keys.contains(tree_key),
+                        "tree_update entry {tree_key} is not in REVM writes and not \
+                         an expected 0x8003 account-property write"
+                    );
+                }
             }
         }
 
@@ -459,8 +462,8 @@ fn execute_block_proven(
     block: &BlockInput,
     batch_meta: &BatchMeta,
     cache_db: &mut CacheDB<ProvenDB>,
-) -> BlockResult {
-    let (tx_results, computed_l2_to_l1_logs) =
+) -> (BlockResult, Vec<(Address, B256)>) {
+    let (tx_results, computed_l2_to_l1_logs, deployed_bytecodes) =
         run_evm_block(chain_id, spec_id, block, batch_meta, cache_db, false);
 
     // Compute block header hash from execution results instead of trusting input.
@@ -545,12 +548,12 @@ fn execute_block_proven(
         }
     }
 
-    BlockResult {
+    (BlockResult {
         block_number: block.number,
         computed_block_header_hash: computed_header_hash,
         tx_results,
         l2_to_l1_logs: computed_l2_to_l1_logs,
-    }
+    }, deployed_bytecodes)
 }
 
 /// Build a ProvenDB for the entire batch.
@@ -898,7 +901,7 @@ fn run_evm_block<DB: DatabaseRef>(
     batch_meta: &BatchMeta,
     cache_db: &mut CacheDB<DB>,
     skip_signature_verification: bool,
-) -> (Vec<TxOutput>, Vec<L2ToL1LogEntry>)
+) -> (Vec<TxOutput>, Vec<L2ToL1LogEntry>, Vec<(Address, B256)>)
 where
     DB::Error: core::fmt::Debug,
 {
@@ -961,7 +964,10 @@ where
         }
     }
 
-    (tx_results, computed_l2_to_l1_logs)
+    // Extract deployed bytecode hashes before dropping the EVM.
+    let deployed_bytecodes = core::mem::take(&mut evm.0.ctx.chain.deployed_bytecode_hashes);
+
+    (tx_results, computed_l2_to_l1_logs, deployed_bytecodes)
 }
 
 /// Collect storage and account diffs from the CacheDB after all blocks have executed.
@@ -1028,7 +1034,7 @@ fn collect_batch_diffs(
 }
 
 fn execute_block_unverified(chain_id: u64, spec_id: ZkSpecId, block: &BlockInput, batch_meta: &BatchMeta, cache_db: &mut CacheDB<SimpleDB>) -> BlockResult {
-    let (tx_results, computed_logs) =
+    let (tx_results, computed_logs, _deployed) =
         run_evm_block(chain_id, spec_id, block, batch_meta, cache_db, true);
     let l2_to_l1_logs = if computed_logs.is_empty() {
         block.l2_to_l1_logs.clone()
