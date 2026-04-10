@@ -137,172 +137,52 @@ fn execute_and_commit_inner(input: &BatchInput) -> (BatchOutput, B256, B256, B25
     };
 
     let meta = &input.batch_meta;
+    validate_block_sequence(input);
 
-    // Validate block sequencing: monotonically increasing numbers and timestamps.
-    assert!(!input.blocks.is_empty(), "batch must contain at least one block");
-    assert!(
-        input.blocks[0].number == meta.block_number_before + 1,
-        "first block number {} must follow block_number_before {}",
-        input.blocks[0].number,
-        meta.block_number_before,
-    );
-    for i in 1..input.blocks.len() {
-        assert!(
-            input.blocks[i].number == input.blocks[i - 1].number + 1,
-            "block numbers must be consecutive: {} follows {}",
-            input.blocks[i].number,
-            input.blocks[i - 1].number,
-        );
-        assert!(
-            input.blocks[i].timestamp >= input.blocks[i - 1].timestamp,
-            "block timestamps must be non-decreasing: {} < {}",
-            input.blocks[i].timestamp,
-            input.blocks[i - 1].timestamp,
-        );
-    }
-
-    // Build the proven database once for the entire batch. All merkle proofs
-    // from all blocks are verified at construction and merged into a single DB.
-    // A CacheDB wraps it so that writes from block N are visible to block N+1.
+    // Execute all blocks with merkle-verified state.
     let proven_db = build_proven_db(input);
     let mut cache_db = CacheDB::new(proven_db);
 
     let mut block_results = Vec::with_capacity(input.blocks.len());
     let mut all_deployed_bytecodes: Vec<(Address, B256)> = Vec::new();
-    // Track computed block header hashes to cross-verify intra-batch BLOCKHASH usage.
     let mut computed_block_hashes: HashMap<u64, B256> = HashMap::new();
+
     for block in &input.blocks {
-        // Verify intra-batch block hashes: if this block references a previous block
-        // in the same batch via block_hashes, check it matches the computed hash.
-        for &(num, hash) in &block.block_hashes {
-            if let Some(&computed) = computed_block_hashes.get(&num) {
-                assert_eq!(
-                    hash, computed,
-                    "intra-batch block hash mismatch for block {num}: \
-                     server provided {hash}, computed {computed}"
-                );
-            }
-        }
+        verify_intra_batch_hashes(block, &computed_block_hashes);
 
         let (result, deployed_bytecodes) = execute_block_proven(
-            input.chain_id,
-            spec_id,
-            block,
-            &mut cache_db,
+            input.chain_id, spec_id, block, &mut cache_db,
         );
         all_deployed_bytecodes.extend(deployed_bytecodes);
-
-        // Record the computed block header hash for subsequent blocks' BLOCKHASH verification
         computed_block_hashes.insert(block.number, result.computed_block_header_hash);
-
         block_results.push(result);
     }
 
-    let output = BatchOutput {
-        chain_id: input.chain_id,
-        block_results,
-    };
+    let output = BatchOutput { chain_id: input.chain_id, block_results };
 
-    // -- Compute batch commitment --
+    // Verify tree update and compute new root.
+    let (storage_diffs, account_diffs) = collect_batch_diffs(&cache_db);
+    let (tree_root_after, new_leaf_count) = verify_tree_update(
+        meta, &storage_diffs, &account_diffs, &all_deployed_bytecodes,
+    );
 
-    // State before: use block_hashes_blake from meta (pre-computed from
-    // the state commitment preimage, which is verified via merkle proofs)
+    // State before.
     let state_before = commitment::state_commitment_hash(
-        &meta.tree_root_before,
-        meta.leaf_count_before,
-        meta.block_number_before,
-        &meta.block_hashes_blake_before,
+        &meta.tree_root_before, meta.leaf_count_before,
+        meta.block_number_before, &meta.block_hashes_blake_before,
         meta.last_block_timestamp_before,
     );
 
-    // Collect batch-level diffs from the CacheDB (comparing final state vs proven pre-state).
-    let (storage_diffs, account_diffs) = collect_batch_diffs(&cache_db);
-
-    // State after: compute new tree root by applying storage writes.
-    // SOUND-3: verify tree update entries match what REVM actually computed.
+    // State after.
     let last_block = input.blocks.last().unwrap();
-
-    let (tree_root_after, new_leaf_count) = if let Some(ref tree_update) = meta.tree_update {
-        // Build map of REVM writes: flat_key -> new_value (storage diffs only)
-        let revm_write_map: HashMap<B256, B256> = storage_diffs
-            .iter()
-            .map(|d| {
-                let addr_bytes: [u8; 20] = d.address.into_array();
-                let slot = B256::from(d.slot.to_be_bytes::<32>());
-                let flat_key = merkle::derive_flat_storage_key(&addr_bytes, &slot);
-                let new_val = B256::from(d.new_value.to_be_bytes::<32>());
-                (flat_key, new_val)
-            })
-            .collect();
-
-        let tree_write_map: HashMap<B256, B256> =
-            tree_update.entries.iter().cloned().collect();
-
-        // SOUND-3: REVM writes must be a subset of tree_update writes.
-        // Every REVM write must appear in tree_update with the same value.
-        for (key, revm_val) in &revm_write_map {
-            assert!(
-                tree_write_map.contains_key(key),
-                "REVM wrote to {key} but tree_update does not include it"
-            );
-            let tree_val = &tree_write_map[key];
-            assert_eq!(
-                tree_val, revm_val,
-                "tree_update value mismatch for {key}: tree={tree_val}, revm={revm_val}"
-            );
-        }
-
-        // SOUND-3 reverse check: every extra tree_update entry (not in REVM
-        // writes) must be a legitimate 0x8003 account-property write.
-        // Build the set of expected 0x8003 flat_keys from accounts that
-        // changed state (nonce/balance) or had bytecode deployed.
-        {
-            let mut expected_account_keys: std::collections::HashSet<B256> = std::collections::HashSet::new();
-            // Accounts with nonce/balance changes
-            for diff in &account_diffs {
-                let addr_bytes: [u8; 20] = diff.address.into_array();
-                expected_account_keys.insert(merkle::derive_account_properties_key(&addr_bytes));
-            }
-            // Accounts with bytecode deployments (from deployer precompile)
-            for (addr, _blake2s_hash) in &all_deployed_bytecodes {
-                let addr_bytes: [u8; 20] = addr.into_array();
-                expected_account_keys.insert(merkle::derive_account_properties_key(&addr_bytes));
-            }
-
-            for tree_key in tree_write_map.keys() {
-                if !revm_write_map.contains_key(tree_key) {
-                    assert!(
-                        expected_account_keys.contains(tree_key),
-                        "tree_update entry {tree_key} is not in REVM writes and not \
-                         an expected 0x8003 account-property write"
-                    );
-                }
-            }
-        }
-
-        // Verify old root matches, apply writes, compute new root
-        tree_update.apply(&meta.tree_root_before)
-    } else {
-        // No tree update — verify REVM produced no storage writes
-        assert!(
-            storage_diffs.is_empty(),
-            "REVM produced storage writes but no tree_update proof was provided"
-        );
-        (meta.tree_root_before, meta.leaf_count_before)
-    };
-
-    // Use the COMPUTED block header hash (from execution), not the input's block_header_hash
     let last_block_result = output.block_results.last().unwrap();
     let block_hashes_blake_after = commitment::block_hashes_blake(
         &meta.previous_block_hashes,
         &last_block_result.computed_block_header_hash,
     );
     let state_after = commitment::state_commitment_hash(
-        &tree_root_after,
-        new_leaf_count,
-        last_block.number,
-        &block_hashes_blake_after,
-        last_block.timestamp,
+        &tree_root_after, new_leaf_count,
+        last_block.number, &block_hashes_blake_after, last_block.timestamp,
     );
 
     // Batch output hash
@@ -835,6 +715,77 @@ fn collect_batch_diffs(cache_db: &CacheDB<ProvenDB>) -> (Vec<StorageDiff>, Vec<A
     }
 
     (storage_diffs, account_diffs)
+}
+
+fn validate_block_sequence(input: &BatchInput) {
+    let meta = &input.batch_meta;
+    assert!(!input.blocks.is_empty(), "batch must contain at least one block");
+    assert!(
+        input.blocks[0].number == meta.block_number_before + 1,
+        "first block number {} must follow block_number_before {}",
+        input.blocks[0].number, meta.block_number_before,
+    );
+    for w in input.blocks.windows(2) {
+        assert!(w[1].number == w[0].number + 1, "block numbers must be consecutive");
+        assert!(w[1].timestamp >= w[0].timestamp, "block timestamps must be non-decreasing");
+    }
+}
+
+fn verify_intra_batch_hashes(block: &BlockInput, computed: &HashMap<u64, B256>) {
+    for &(num, hash) in &block.block_hashes {
+        if let Some(&expected) = computed.get(&num) {
+            assert_eq!(hash, expected,
+                "intra-batch block hash mismatch for block {num}: \
+                 server={hash}, computed={expected}");
+        }
+    }
+}
+
+fn verify_tree_update(
+    meta: &BatchMeta,
+    storage_diffs: &[StorageDiff],
+    account_diffs: &[AccountDiff],
+    deployed_bytecodes: &[(Address, B256)],
+) -> (B256, u64) {
+    if let Some(ref tree_update) = meta.tree_update {
+        let revm_write_map: HashMap<B256, B256> = storage_diffs.iter().map(|d| {
+            let addr_bytes: [u8; 20] = d.address.into_array();
+            let slot = B256::from(d.slot.to_be_bytes::<32>());
+            (merkle::derive_flat_storage_key(&addr_bytes, &slot),
+             B256::from(d.new_value.to_be_bytes::<32>()))
+        }).collect();
+
+        let tree_write_map: HashMap<B256, B256> = tree_update.entries.iter().cloned().collect();
+
+        // Forward: every REVM write must be in tree_update.
+        for (key, revm_val) in &revm_write_map {
+            let tree_val = tree_write_map.get(key).unwrap_or_else(||
+                panic!("REVM wrote to {key} but tree_update does not include it"));
+            assert_eq!(tree_val, revm_val,
+                "tree_update value mismatch for {key}: tree={tree_val}, revm={revm_val}");
+        }
+
+        // Reverse: every extra entry must be a legitimate 0x8003 account write.
+        let expected_keys: std::collections::HashSet<B256> = account_diffs.iter()
+            .map(|d| merkle::derive_account_properties_key(&d.address.into_array()))
+            .chain(deployed_bytecodes.iter()
+                .map(|(a, _)| merkle::derive_account_properties_key(&a.into_array())))
+            .collect();
+
+        for key in tree_write_map.keys() {
+            if !revm_write_map.contains_key(key) {
+                assert!(expected_keys.contains(key),
+                    "tree_update entry {key} is not in REVM writes and not \
+                     an expected 0x8003 account-property write");
+            }
+        }
+
+        tree_update.apply(&meta.tree_root_before)
+    } else {
+        assert!(storage_diffs.is_empty(),
+            "REVM produced storage writes but no tree_update proof was provided");
+        (meta.tree_root_before, meta.leaf_count_before)
+    }
 }
 
 /// Execute a batch from bincode-serialized BatchInput bytes.
