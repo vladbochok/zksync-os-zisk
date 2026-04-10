@@ -167,11 +167,11 @@ mod tests {
                     data: vec![],
                     nonce: 0,
                     chain_id: Some(270),
-                    tx_type: 2,
+                    tx_type: 0x7f, // L1 priority tx
                     gas_used_override: Some(0),
                     force_fail: true,
                     mint: None,
-                    refund_recipient: None,
+                    refund_recipient: Some(sender),
                     is_l1_tx: true,
                     l1_tx_hash: Some(alloy_primitives::keccak256(b"dummy-l1-tx")),
                     signed_tx_bytes: Some(b"dummy-l1-tx".to_vec()),

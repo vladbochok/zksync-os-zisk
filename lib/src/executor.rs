@@ -471,18 +471,11 @@ fn execute_block_proven(
     // actual execution, not attacker-controlled input.
     let total_gas_used: u64 = tx_results.iter().map(|t| t.gas_used).sum();
 
-    // Compute transactions rolling hash from tx hashes in the input.
-    // For L2 txs, the hash comes from signed_tx_bytes (keccak256(signed_bytes)).
-    // For L1 txs, it comes from l1_tx_hash.
+    // Compute transactions rolling hash using the same tx_hash logic as build_tx.
     let tx_hashes: Vec<B256> = block.transactions.iter().map(|tx| {
         if let Some(hash) = tx.l1_tx_hash {
-            // L1 priority txs use their canonical priority queue hash.
             hash
-        } else if tx.tx_type == 0x7e {
-            // Upgrade txs use the batch-level upgrade tx hash.
-            batch_meta.upgrade_tx_hash
         } else if let Some(ref signed) = tx.signed_tx_bytes {
-            // L2 txs use keccak256 of the signed EIP-2718 encoded bytes.
             alloy_primitives::keccak256(signed)
         } else {
             B256::ZERO
@@ -756,13 +749,25 @@ fn build_tx(input: &TxInput) -> ZKsyncTx<TxEnv> {
         builder = builder.gas_priority_fee(Some(fee));
     }
 
+    // Compute the trusted tx_hash:
+    // - L1 priority txs: use l1_tx_hash (canonical priority queue hash)
+    // - L2 txs: keccak256 of EIP-2718 encoded signed bytes
+    // - Fallback: B256::ZERO (e.g. upgrade txs with l1_tx_hash set by server)
+    let tx_hash = if let Some(hash) = input.l1_tx_hash {
+        hash
+    } else if let Some(ref signed) = input.signed_tx_bytes {
+        alloy_primitives::keccak256(signed)
+    } else {
+        B256::ZERO
+    };
+
     ZKsyncTxBuilder::new()
         .base(builder)
         .mint(input.mint.unwrap_or_default())
         .refund_recipient(input.refund_recipient)
         .gas_used_override(input.gas_used_override)
         .force_fail(input.force_fail)
-        .l1_tx_hash(input.l1_tx_hash)
+        .tx_hash(tx_hash)
         .build()
         .expect("failed to build ZKsyncTx")
 }
