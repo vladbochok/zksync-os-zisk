@@ -935,13 +935,8 @@ where
         };
         match evm.transact_commit(tx) {
             Ok(result) => {
-                let success = result.is_success();
-
-                // For L1→L2 transactions (both priority and upgrade), emit the
-                // bootloader result log.
-                if let Some(tx_hash) = tx_input.l1_tx_hash {
-                    evm.0.ctx.chain.emit_l1_tx_result(tx_hash, success);
-                }
+                // L1 tx result log is emitted automatically by the handler's
+                // post_execution when l1_tx_hash is set on the transaction.
 
                 for log in evm.0.ctx.chain.take_logs() {
                     computed_l2_to_l1_logs.push(L2ToL1LogEntry {
@@ -955,7 +950,7 @@ where
                 }
 
                 tx_results.push(TxOutput {
-                    success,
+                    success: result.is_success(),
                     gas_used: result.gas_used(),
                     output: result.output().map(|b| b.to_vec()).unwrap_or_default(),
                 });
