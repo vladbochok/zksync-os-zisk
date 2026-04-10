@@ -754,12 +754,8 @@ fn verify_tree_update(
             for (key, tree_val) in &tree_update.entries {
                 let computed_val = revm_writes.get(key).unwrap_or_else(||
                     panic!("tree_update has {key} not in computed writes"));
-                // TODO: strict value check once AccountProperties encoding is lossless.
-                if tree_val != computed_val {
-                    eprintln!(
-                        "0x8003 value mismatch for {key}: tree={tree_val}, computed={computed_val}"
-                    );
-                }
+                assert_eq!(tree_val, computed_val,
+                    "tree_update value mismatch for {key}: tree={tree_val}, computed={computed_val}");
             }
             tree_update.apply(&meta.tree_root_before)
         }
