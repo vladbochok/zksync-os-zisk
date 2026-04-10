@@ -22,3 +22,6 @@ codegen-units = 1
 # Solution: stub v0.2 here, and also add getrandom 0.3 as direct dep with our stub.
 [patch.crates-io]
 getrandom = { path = "getrandom-stub" }
+# Route all keccak-f permutations through ZiSK hardware-accelerated syscall.
+# Every crate using tiny-keccak (revm, alloy, zksync-os-revm) gets this for free.
+tiny-keccak = { path = "tiny-keccak-patch" }
