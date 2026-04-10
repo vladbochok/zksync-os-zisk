@@ -685,24 +685,20 @@ fn build_proven_tx(input: &TxInput) -> ZKsyncTx<TxEnv> {
         )
     });
 
-    if input.is_l1_tx {
-        // L1 priority txs: signed_tx_bytes contains ABI-encoded
+    if input.is_l1_tx || input.tx_type == 0x7e {
+        // L1 priority and upgrade txs: signed_tx_bytes contains ABI-encoded
         // L2CanonicalTransaction. Verify keccak256(abi_bytes) == l1_tx_hash.
         // This binds the tx data (mint, value, caller) to its canonical hash,
         // preventing a malicious server from substituting tx fields.
         let claimed_hash = input.l1_tx_hash.unwrap_or_else(|| {
-            panic!("L1 tx from {} missing l1_tx_hash", input.caller)
+            panic!("L1/upgrade tx from {} missing l1_tx_hash", input.caller)
         });
         let computed_hash = alloy_primitives::keccak256(signed_bytes);
         assert_eq!(
             computed_hash, claimed_hash,
             "L1 tx hash mismatch: keccak256(signed_tx_bytes)={computed_hash}, \
-             claimed l1_tx_hash={claimed_hash}. The signed_tx_bytes must be the \
-             ABI-encoded L2CanonicalTransaction whose hash matches l1_tx_hash."
+             claimed l1_tx_hash={claimed_hash}"
         );
-    } else if input.tx_type == 0x7e {
-        // Upgrade txs: verified by L1 protocol. Hash verification is best-effort
-        // because the ABI roundtrip encoding may not exactly reproduce the original.
     } else {
         // L2 txs: signed_tx_bytes contains EIP-2718 encoded signed tx.
         // Verify ecrecover(signature) == caller.
