@@ -123,6 +123,25 @@ mod tests {
         assert_eq!(recovered_root, tree_root, "proof should recover tree root");
         assert_eq!(value.unwrap(), sender_props_hash, "proof should return correct value");
 
+        // Build proper ABI-encoded L2CanonicalTransaction for the L1 tx.
+        let l1_abi = {
+            let mut abi = vec![0u8; 32 + 19 * 32 + 5 * 32];
+            abi[31] = 0x20; // outer offset
+            abi[32 + 31] = 0x7f; // txType
+            abi[32 + 32 + 12..32 + 32 + 32].copy_from_slice(sender.as_slice()); // from
+            abi[32 + 64 + 12..32 + 64 + 32].copy_from_slice(recipient.as_slice()); // to
+            abi[32 + 96 + 24..32 + 96 + 32].copy_from_slice(&21_000u64.to_be_bytes()); // gasLimit
+            abi[32 + 160 + 16..32 + 160 + 32].copy_from_slice(&250_000_000u128.to_be_bytes()); // maxFeePerGas
+            abi[32 + 352 + 12..32 + 352 + 32].copy_from_slice(sender.as_slice()); // reserved[1]=refund
+            let dyn_base = 19u32 * 32;
+            for j in 0..5u32 {
+                let off = 32 + (14 + j as usize) * 32;
+                abi[off + 28..off + 32].copy_from_slice(&(dyn_base + j * 32).to_be_bytes());
+            }
+            abi
+        };
+        let l1_tx_hash = alloy_primitives::keccak256(&l1_abi);
+
         // Now build a BatchInput with this proof
         let batch_input = BatchInput {
             chain_id: 270,
@@ -167,14 +186,14 @@ mod tests {
                     data: vec![],
                     nonce: 0,
                     chain_id: Some(270),
-                    tx_type: 0x7f, // L1 priority tx
+                    tx_type: 0x7f,
                     gas_used_override: Some(0),
                     force_fail: true,
                     mint: None,
                     refund_recipient: Some(sender),
                     is_l1_tx: true,
-                    l1_tx_hash: Some(alloy_primitives::keccak256(b"dummy-l1-tx")),
-                    signed_tx_bytes: Some(b"dummy-l1-tx".to_vec()),
+                    l1_tx_hash: Some(l1_tx_hash),
+                    signed_tx_bytes: Some(l1_abi.clone()),
                 }],
                 storage: vec![],
                 block_hashes: vec![],
@@ -183,7 +202,7 @@ mod tests {
                     is_service: true,
                     tx_number_in_block: 0,
                     sender: "0x0000000000000000000000000000000000008001".parse().unwrap(),
-                    key: alloy_primitives::keccak256(b"dummy-l1-tx"),
+                    key: l1_tx_hash,  // tx_hash from the ABI encoding
                     value: B256::ZERO,  // force_fail → success=false → value=0
                 }],
                 expected_tree_root: B256::ZERO,

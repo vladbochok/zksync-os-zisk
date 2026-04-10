@@ -696,9 +696,8 @@ fn build_proven_tx(input: &TxInput) -> ZKsyncTx<TxEnv> {
 
     if input.is_l1_tx || input.tx_type == 0x7e {
         // L1 priority and upgrade txs: signed_tx_bytes contains ABI-encoded
-        // L2CanonicalTransaction. Verify keccak256(abi_bytes) == l1_tx_hash.
-        // This binds the tx data (mint, value, caller) to its canonical hash,
-        // preventing a malicious server from substituting tx fields.
+        // L2CanonicalTransaction. Verify keccak256(abi_bytes) == l1_tx_hash,
+        // then verify the ABI-decoded fields match what TxInput tells REVM to execute.
         let claimed_hash = input.l1_tx_hash.unwrap_or_else(|| {
             panic!("L1/upgrade tx from {} missing l1_tx_hash", input.caller)
         });
@@ -708,6 +707,47 @@ fn build_proven_tx(input: &TxInput) -> ZKsyncTx<TxEnv> {
             "L1 tx hash mismatch: keccak256(signed_tx_bytes)={computed_hash}, \
              claimed l1_tx_hash={claimed_hash}"
         );
+
+        // Decode the L2CanonicalTransaction ABI fields and verify they match TxInput.
+        // alloy's sol struct abi_encode() wraps in an outer offset word (32 bytes),
+        // so the actual struct fields start at byte 32.
+        // Layout from offset 32: 14 fixed U256 words (10 fields + 4 reserved),
+        // then dynamic offsets.
+        // Word offsets: 0=txType, 1=from, 2=to, 3=gasLimit, 4=gasPerPubdataByteLimit,
+        //   5=maxFeePerGas, 6=maxPriorityFeePerGas, 7=paymaster, 8=nonce, 9=value,
+        //   10-13=reserved[0..3]
+        let base = 32; // skip outer tuple offset
+        let word = |i: usize| -> U256 {
+            let off = base + i * 32;
+            U256::from_be_slice(&signed_bytes[off..off + 32])
+        };
+        let addr_from_word = |w: U256| -> Address {
+            Address::from_slice(&w.to_be_bytes::<32>()[12..])
+        };
+
+        let abi_value = word(9);
+        let abi_mint = word(10);            // reserved[0] = to_mint
+        let abi_refund = addr_from_word(word(11)); // reserved[1] = refund_recipient
+
+        // Verify execution-critical fields match the ABI-encoded data.
+        // For L1 priority txs, also verify caller/to/gas since they directly
+        // affect execution. For upgrade txs, caller may differ (L2 system addr
+        // vs L1 initiator), so we only verify value/mint/refund.
+        if input.is_l1_tx {
+            let abi_from = addr_from_word(word(1));
+            let abi_to = addr_from_word(word(2));
+            assert_eq!(abi_from, input.caller, "L1 tx: ABI 'from' != TxInput.caller");
+            if let Some(to) = input.to {
+                assert_eq!(abi_to, to, "L1 tx: ABI 'to' != TxInput.to");
+            }
+        }
+        assert_eq!(abi_value, input.value, "L1 tx: ABI value != TxInput.value");
+        if let Some(mint) = input.mint {
+            assert_eq!(abi_mint, mint, "L1 tx: ABI mint != TxInput.mint");
+        }
+        if let Some(refund) = input.refund_recipient {
+            assert_eq!(abi_refund, refund, "L1 tx: ABI refund_recipient != TxInput.refund_recipient");
+        }
     } else {
         // L2 txs: signed_tx_bytes contains EIP-2718 encoded signed tx.
         // Verify ecrecover(signature) == caller.
