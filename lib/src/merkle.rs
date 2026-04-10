@@ -391,6 +391,55 @@ impl AccountProperties {
     pub fn hash(encoded: &[u8]) -> B256 {
         blake2s(encoded)
     }
+
+    /// Patch nonce and balance in a raw 124-byte preimage, return the new hash.
+    /// Used to compute expected 0x8003 values after execution.
+    pub fn patch_nonce_balance(preimage: &[u8], nonce: u64, balance: &[u8; 32]) -> B256 {
+        let mut buf = [0u8; Self::ENCODED_SIZE];
+        buf.copy_from_slice(&preimage[..Self::ENCODED_SIZE]);
+        buf[8..16].copy_from_slice(&nonce.to_be_bytes());
+        buf[16..48].copy_from_slice(balance);
+        blake2s(&buf)
+    }
+
+    /// Patch nonce, balance, AND bytecode fields in a raw 124-byte preimage.
+    /// Used when account's code changed (deployment via deployer precompile).
+    pub fn patch_full(
+        preimage: &[u8],
+        nonce: u64,
+        balance: &[u8; 32],
+        bytecode_hash_blake2s: &B256,
+        unpadded_code_len: u32,
+        observable_bytecode_hash: &B256,
+    ) -> B256 {
+        let mut buf = [0u8; Self::ENCODED_SIZE];
+        buf.copy_from_slice(&preimage[..Self::ENCODED_SIZE]);
+        buf[8..16].copy_from_slice(&nonce.to_be_bytes());
+        buf[16..48].copy_from_slice(balance);
+        buf[48..80].copy_from_slice(bytecode_hash_blake2s.as_slice());
+        buf[80..84].copy_from_slice(&unpadded_code_len.to_be_bytes());
+        buf[88..120].copy_from_slice(observable_bytecode_hash.as_slice());
+        buf[120..124].copy_from_slice(&unpadded_code_len.to_be_bytes());
+        blake2s(&buf)
+    }
+
+    /// Build a fresh 124-byte preimage for a brand new account (no prior state).
+    pub fn encode_new(
+        nonce: u64,
+        balance: &[u8; 32],
+        bytecode_hash_blake2s: &B256,
+        unpadded_code_len: u32,
+        observable_bytecode_hash: &B256,
+    ) -> B256 {
+        let mut buf = [0u8; Self::ENCODED_SIZE];
+        buf[8..16].copy_from_slice(&nonce.to_be_bytes());
+        buf[16..48].copy_from_slice(balance);
+        buf[48..80].copy_from_slice(bytecode_hash_blake2s.as_slice());
+        buf[80..84].copy_from_slice(&unpadded_code_len.to_be_bytes());
+        buf[88..120].copy_from_slice(observable_bytecode_hash.as_slice());
+        buf[120..124].copy_from_slice(&unpadded_code_len.to_be_bytes());
+        blake2s(&buf)
+    }
 }
 
 // ---------------------------------------------------------------------------

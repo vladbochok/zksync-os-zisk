@@ -188,19 +188,3 @@ pub struct TxOutput {
     pub output: Vec<u8>,
 }
 
-#[derive(Serialize, Deserialize)]
-pub struct StorageDiff {
-    pub address: Address,
-    pub slot: U256,
-    pub old_value: U256,
-    pub new_value: U256,
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct AccountDiff {
-    pub address: Address,
-    pub nonce_before: u64,
-    pub nonce_after: u64,
-    pub balance_before: U256,
-    pub balance_after: U256,
-}
