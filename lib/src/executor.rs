@@ -300,8 +300,17 @@ pub fn execute_and_commit(input: &BatchInput) -> (BatchOutput, B256) {
                     l1_tx_hashes.push(*h);
                 }
                 num_l1_txs += 1;
-            } else if tx.tx_type != 0x7e {
-                // Upgrade txs (0x7e) are system txs that count as neither L1 nor L2.
+            } else if tx.tx_type == 0x7e {
+                // Upgrade txs: verify l1_tx_hash matches batch_meta.upgrade_tx_hash.
+                // Both are used in the commitment — they must be consistent.
+                if let Some(h) = &tx.l1_tx_hash {
+                    assert_eq!(
+                        *h, meta.upgrade_tx_hash,
+                        "upgrade tx l1_tx_hash {h} != batch_meta.upgrade_tx_hash {}",
+                        meta.upgrade_tx_hash
+                    );
+                }
+            } else {
                 num_l2_txs += 1;
             }
         }
