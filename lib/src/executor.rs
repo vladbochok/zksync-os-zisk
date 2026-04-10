@@ -79,7 +79,15 @@ impl DatabaseRef for ProvenDB {
     }
 
     fn code_by_hash_ref(&self, code_hash: B256) -> Result<Bytecode, Self::Error> {
-        Ok(self.bytecodes.get(&code_hash).cloned().unwrap_or_default())
+        if code_hash.is_zero() || code_hash == KECCAK_EMPTY {
+            return Ok(Bytecode::default());
+        }
+        self.bytecodes.get(&code_hash).cloned().ok_or_else(|| {
+            ProvenDBError(format!(
+                "no bytecode for code_hash {code_hash}. The server must include \
+                 all contract bytecodes in the batch."
+            ))
+        })
     }
 
     fn storage_ref(&self, address: Address, index: U256) -> Result<U256, Self::Error> {
