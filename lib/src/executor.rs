@@ -781,41 +781,35 @@ fn verify_intra_batch_hashes(block: &BlockInput, computed: &HashMap<u64, B256>) 
 }
 
 /// Verify tree_update entries match computed writes.
-/// Storage writes are checked strictly (bidirectional, value must match).
-/// Account-property writes (0x8003) are checked for key presence — the
-/// exact value may differ due to fields we can't reconstruct (versioning,
-/// artifacts_len). TODO: full value verification when all fields are available.
+/// Uses the set-theoretic identity: |A| == |B| ∧ A ⊆ B ⟹ A == B.
+/// One length check + one forward pass — no reverse iteration needed.
 fn verify_tree_update(
     meta: &BatchMeta,
     revm_writes: &HashMap<B256, B256>,
 ) -> (B256, u64) {
-    if let Some(ref tree_update) = meta.tree_update {
-        let tree_writes: HashMap<B256, B256> = tree_update.entries.iter().cloned().collect();
-
-        // Forward: every computed write must be in tree_update.
-        for (key, val) in revm_writes {
-            let tree_val = tree_writes.get(key).unwrap_or_else(||
-                panic!("computed write to {key} but tree_update does not include it"));
-            // Value check: strict for storage, informational for 0x8003.
-            if tree_val != val {
-                eprintln!(
-                    "tree_update value mismatch for {key}: tree={tree_val}, computed={val} \
-                     (0x8003 account-property encoding may differ)"
-                );
+    match meta.tree_update {
+        Some(ref tree_update) => {
+            assert_eq!(
+                revm_writes.len(), tree_update.entries.len(),
+                "write count mismatch: computed {} writes, tree_update has {}",
+                revm_writes.len(), tree_update.entries.len(),
+            );
+            for (key, tree_val) in &tree_update.entries {
+                let computed_val = revm_writes.get(key).unwrap_or_else(||
+                    panic!("tree_update has {key} not in computed writes"));
+                // TODO: strict value check once AccountProperties encoding is lossless.
+                if tree_val != computed_val {
+                    eprintln!(
+                        "0x8003 value mismatch for {key}: tree={tree_val}, computed={computed_val}"
+                    );
+                }
             }
+            tree_update.apply(&meta.tree_root_before)
         }
-
-        // Reverse: every tree_update entry must be in computed writes.
-        for key in tree_writes.keys() {
-            assert!(revm_writes.contains_key(key),
-                "tree_update has entry {key} not in computed writes");
+        None => {
+            assert!(revm_writes.is_empty(), "writes exist but no tree_update provided");
+            (meta.tree_root_before, meta.leaf_count_before)
         }
-
-        tree_update.apply(&meta.tree_root_before)
-    } else {
-        assert!(revm_writes.is_empty(),
-            "computed writes exist but no tree_update proof was provided");
-        (meta.tree_root_before, meta.leaf_count_before)
     }
 }
 
