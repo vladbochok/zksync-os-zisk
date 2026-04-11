@@ -113,14 +113,12 @@ pub(super) fn build_proven_db(input: &BatchInput) -> ProvenDB {
     let mut bytecodes: HashMap<B256, Bytecode> = HashMap::new();
     let mut block_hashes: HashMap<u64, B256> = HashMap::new();
 
-    // Load batch-level bytecodes and verify each one hashes to its key.
-    // Regular contracts use keccak256; force-deployed system contracts use blake2s.
+    // Load batch-level bytecodes. All are keyed by keccak256(code).
     for (hash, code) in &input.bytecodes {
-        let keccak_hash = crate::hash::keccak256(code);
-        let blake2s_hash = crate::merkle::blake2s(code);
-        assert!(
-            keccak_hash == *hash || blake2s_hash == *hash,
-            "bytecode hash mismatch: key={hash}, keccak={keccak_hash}, blake2s={blake2s_hash}"
+        let computed = crate::hash::keccak256(code);
+        assert_eq!(
+            computed, *hash,
+            "bytecode hash mismatch: key={hash}, keccak256={computed}"
         );
         bytecodes.insert(*hash, Bytecode::new_raw(Bytes::copy_from_slice(code)));
     }
