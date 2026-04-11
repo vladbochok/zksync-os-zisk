@@ -101,41 +101,40 @@ pub struct BlockInput {
 
 /// Transaction authentication and hash binding.
 ///
-/// Each variant carries the raw bytes whose hash is used in the block header
-/// rolling hash and the batch commitment. The executor verifies:
-/// - L1/Upgrade: `keccak256(abi_encoded) == tx_hash`, then checks ABI fields match TxInput
-/// - L2: `ecrecover(signed_bytes) == caller`
+/// Each variant carries the raw bytes from which all execution fields are
+/// derived. The executor verifies and extracts:
+/// - L1/Upgrade: `keccak256(abi_encoded) == tx_hash`, then decodes all fields from ABI
+/// - L2: `ecrecover(signed_bytes)` recovers caller, all fields decoded from RLP
 #[derive(Serialize, Deserialize, Clone)]
 pub enum TxAuth {
     /// L1 priority deposit. `abi_encoded` is the ABI-encoded L2CanonicalTransaction
-    /// whose `keccak256` equals `tx_hash`.
+    /// whose `keccak256` equals `tx_hash`. All execution fields are extracted from it.
     L1 { tx_hash: B256, abi_encoded: Vec<u8> },
     /// Protocol upgrade transaction. Same ABI encoding as L1.
     Upgrade { tx_hash: B256, abi_encoded: Vec<u8> },
-    /// L2 transaction. `signed_bytes` is EIP-2718 encoded; ecrecover verifies caller.
+    /// L2 transaction. `signed_bytes` is EIP-2718 encoded; all execution fields
+    /// are decoded from the RLP envelope, caller recovered via ecrecover.
     L2 { signed_bytes: Vec<u8> },
 }
 
+/// Transaction input for the ZiSK executor.
+///
+/// Execution-critical fields (caller, to, value, data, nonce, gas_limit,
+/// gas_price) are derived from the authenticated `auth` data — NOT from
+/// this struct. Only `chain_id` (for L1/upgrade, not in ABI),
+/// `gas_used_override`, and `force_fail` are used from here.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct TxInput {
-    pub caller: Address,
-    pub gas_limit: u64,
-    pub gas_price: u128,
-    pub gas_priority_fee: Option<u128>,
-    pub to: Option<Address>,
-    pub value: U256,
-    pub data: Vec<u8>,
-    pub nonce: u64,
+    /// L2 chain ID. Used for L1/upgrade txs (not present in ABI encoding)
+    /// and as fallback for L2 txs without chain_id in the envelope.
     pub chain_id: Option<u64>,
-    pub tx_type: u8,
     /// Gas used override from the server's execution.
     /// When set, REVM uses this instead of its own gas computation.
     pub gas_used_override: Option<u64>,
     /// When true, REVM synthesizes a REVERT without executing the transaction.
     pub force_fail: bool,
-    pub mint: Option<U256>,
-    pub refund_recipient: Option<Address>,
     /// Transaction authentication and hash binding.
+    /// All execution fields are derived from this.
     pub auth: TxAuth,
 }
 

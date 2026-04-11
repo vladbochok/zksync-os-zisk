@@ -178,20 +178,9 @@ mod tests {
                 // accounts we don't have proofs for in this minimal tree).
                 // This test focuses on verifying proof + preimage decoding.
                 transactions: vec![TxInput {
-                    caller: sender,
-                    gas_limit: 21_000,
-                    gas_price: 250_000_000,
-                    gas_priority_fee: Some(0),
-                    to: Some(recipient),
-                    value: U256::ZERO,
-                    data: vec![],
-                    nonce: 0,
                     chain_id: Some(270),
-                    tx_type: 0x7f,
                     gas_used_override: Some(0),
                     force_fail: true,
-                    mint: None,
-                    refund_recipient: Some(sender),
                     auth: TxAuth::L1 { tx_hash: l1_tx_hash, abi_encoded: l1_abi.clone() },
                 }],
                 block_hashes: vec![],
@@ -281,20 +270,9 @@ mod tests {
                 storage_proofs: vec![(sender_flat_key, proof)],
                 account_preimages: vec![(sender, sender_props)],
                 transactions: vec![TxInput {
-                    caller: sender,
-                    gas_limit: 21_000,
-                    gas_price: 250_000_000,
-                    gas_priority_fee: Some(0),
-                    to: Some(recipient),
-                    value: U256::from(1_000_000_000_000_000_000u128),
-                    data: vec![],
-                    nonce: 0,
                     chain_id: Some(270),
-                    tx_type: 2,
                     gas_used_override: None,
                     force_fail: false,
-                    mint: None,
-                    refund_recipient: None,
                     auth: TxAuth::L1 {
                         tx_hash: alloy_primitives::keccak256(b"dummy-l1-tx"),
                         abi_encoded: b"dummy-l1-tx".to_vec(),
@@ -421,13 +399,13 @@ mod tests {
         for (i, b) in batch.blocks.iter().enumerate() {
             println!("  Block {}: {} txs, types: {:?}, {} account_preimages",
                 b.number, b.transactions.len(),
-                b.transactions.iter().map(|t| format!("0x{:02x}", t.tx_type)).collect::<Vec<_>>(),
+                b.transactions.iter().map(|t| match &t.auth {
+                    TxAuth::L1 { .. } => "L1".to_string(),
+                    TxAuth::Upgrade { .. } => "Upgrade".to_string(),
+                    TxAuth::L2 { .. } => "L2".to_string(),
+                }).collect::<Vec<_>>(),
                 b.account_preimages.len(),
             );
-            for tx in &b.transactions {
-                println!("    tx: caller={}, to={:?}, data_len={}, gas_limit={}, value={}",
-                    tx.caller, tx.to, tx.data.len(), tx.gas_limit, tx.value);
-            }
         }
 
         if let Some(ref tu) = batch.batch_meta.tree_update {
@@ -490,9 +468,13 @@ mod tests {
         );
         for block in &batch_input.blocks {
             for (i, tx) in block.transactions.iter().enumerate() {
-                println!("  tx[{i}]: type=0x{:02x} caller={} force_fail={} gas_override={:?} is_l1={}",
-                    tx.tx_type, tx.caller, tx.force_fail, tx.gas_used_override,
-                    matches!(tx.auth, TxAuth::L1 { .. }));
+                println!("  tx[{i}]: force_fail={} gas_override={:?} auth={}",
+                    tx.force_fail, tx.gas_used_override,
+                    match &tx.auth {
+                        TxAuth::L1 { tx_hash, .. } => format!("L1({tx_hash})"),
+                        TxAuth::Upgrade { tx_hash, .. } => format!("Upgrade({tx_hash})"),
+                        TxAuth::L2 { signed_bytes } => format!("L2({}B)", signed_bytes.len()),
+                    });
             }
         }
         println!(
