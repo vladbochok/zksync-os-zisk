@@ -3200,6 +3200,7 @@ dependencies = [
  "alloy-primitives",
  "bincode",
  "blake2",
+ "k256",
  "revm",
  "serde",
  "tiny-keccak",

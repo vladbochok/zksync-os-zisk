@@ -542,4 +542,21 @@ mod tests {
             );
         }
     }
+
+    /// Run the executor on a real Dawn batch dump.
+    /// Invoke with: cargo test --release test_real_dawn_batch -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn test_real_dawn_batch() {
+        let path = std::env::var("ZISK_BATCH_PATH")
+            .unwrap_or_else(|_| "/tmp/zisk_dump/batch_3555_zisk.bin".into());
+        let data = std::fs::read(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+        let len = u64::from_le_bytes(data[..8].try_into().unwrap()) as usize;
+        let bincode_data = &data[8..8 + len];
+        println!("bincode bytes: {len}");
+        match crate::executor::execute_and_commit_from_bincode(bincode_data) {
+            Ok((_out, commitment)) => println!("OK commitment: {commitment}"),
+            Err(e) => panic!("executor failed: {e:#}"),
+        }
+    }
 }

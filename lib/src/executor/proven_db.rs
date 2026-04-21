@@ -198,24 +198,40 @@ pub(super) fn build_proven_db(input: &BatchInput) -> ProvenDB {
         }
 
         // Verify block hashes against batch_meta.previous_block_hashes.
-        let block_number_before = meta.block_number_before;
-        for &(num, hash) in &block.block_hashes {
-            if block_number_before > 0 && num <= block_number_before {
-                let oldest_available = block_number_before.saturating_sub(254);
-                if num >= oldest_available {
-                    let idx = (num - oldest_available) as usize;
-                    if idx < meta.previous_block_hashes.len() {
-                        let verified_hash = meta.previous_block_hashes[idx];
-                        if !verified_hash.is_zero() {
-                            assert_eq!(
-                                hash, verified_hash,
-                                "block hash mismatch for block {num}: input={hash}, verified={verified_hash}"
-                            );
+        //
+        // previous_block_hashes is the 255-entry ring preceding the LAST block
+        // of the batch (it feeds block_hashes_blake_after). Index j = hash of
+        // block (last_block - 255 + j). We use the last block's number, not
+        // `block_number_before` (which is first_block - 1), so multi-block
+        // batches index into the ring correctly.
+        if let Some(last_block) = input.blocks.last() {
+            let last_num = last_block.number;
+            if last_num >= 255 {
+                let oldest_available = last_num - 255;
+                for &(num, hash) in &block.block_hashes {
+                    if num >= oldest_available && num < last_num {
+                        let idx = (num - oldest_available) as usize;
+                        if idx < meta.previous_block_hashes.len() {
+                            let verified_hash = meta.previous_block_hashes[idx];
+                            if !verified_hash.is_zero() {
+                                assert_eq!(
+                                    hash, verified_hash,
+                                    "block hash mismatch for block {num}: input={hash}, verified={verified_hash}"
+                                );
+                            }
                         }
                     }
+                    block_hashes.insert(num, hash);
+                }
+            } else {
+                for &(num, hash) in &block.block_hashes {
+                    block_hashes.insert(num, hash);
                 }
             }
-            block_hashes.insert(num, hash);
+        } else {
+            for &(num, hash) in &block.block_hashes {
+                block_hashes.insert(num, hash);
+            }
         }
 
     }
